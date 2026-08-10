@@ -439,6 +439,10 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
           <label class="chk"><input type="checkbox" id="gCap" checked> Burn captions into the video</label>
           <label class="chk"><input type="checkbox" id="gLower" checked> Lower third with story + group</label>
           <label class="chk"><input type="checkbox" id="gImg" checked> Put the story's image where the big MV sits</label>
+          <div class="field" style="margin-top:10px"><label>Image on screen right now</label>
+            <div class="row"><button class="btn sm go" id="btnHeroImg" style="flex:1">Load an image</button>
+              <button class="btn sm" id="btnHeroClr">Clear</button></div>
+            <p class="note" id="heroName">Nothing loaded — the big MV is showing. A story pulled from the rundown brings its own image and overrides this.</p></div>
           <label class="chk"><input type="checkbox" id="gBug" checked> Corner bug and date</label>
           <div class="field" style="margin-top:10px"><label>Anchor position</label>
             <div class="seg" id="segAnchor">
@@ -722,6 +726,16 @@ function editStory(i) {
   renderRundown();
 }
 $("btnAddStory").onclick = () => editStory(S.items.length);
+$("btnHeroImg").onclick = () => {
+  const f = document.createElement("input");
+  f.type = "file"; f.accept = "image/*";
+  f.onchange = () => f.files[0] && loadHero(f.files[0]);
+  f.click();
+};
+$("btnHeroClr").onclick = () => {
+  S.heroImg = null;
+  $("heroName").textContent = "Nothing loaded \u2014 the big MV is showing.";
+};
 
 /* drop any picture in from this computer — resized so it doesn't bloat the page */
 function pickImage(it) {
@@ -1266,7 +1280,7 @@ function buildMask(ts) {
 }
 
 /* --- graphics --- */
-function roundRect(x, r, a, b, w, h, rad) {
+function roundRect(x, a, b, w, h, rad) {
   x.beginPath(); x.moveTo(a + rad, b);
   x.arcTo(a + w, b, a + w, b + h, rad); x.arcTo(a + w, b + h, a, b + h, rad);
   x.arcTo(a, b + h, a, b, rad); x.arcTo(a, b, a + w, b, rad); x.closePath();
@@ -1278,10 +1292,26 @@ function storyImg(item) {
   if (!im) { im = new Image(); im.src = item.image; storyImgs[item.id] = im; }
   return (im.complete && im.naturalWidth) ? im : null;
 }
+/* a picture loaded by hand, for when you are not working from the rundown */
+S.heroImg = null;
+function loadHero(file) {
+  const r = new FileReader();
+  r.onload = () => {
+    const im = new Image();
+    im.onload = () => {
+      S.heroImg = im;
+      $("heroName").innerHTML = "<b style=\"color:var(--shine)\">" + esc(file.name) +
+        "</b> is on screen. It stays until you clear it.";
+    };
+    im.src = r.result;
+  };
+  r.readAsDataURL(file);
+}
 /* whatever is standing where the big MV normally stands */
 function drawHero(x, item) {
   const R = HERO;
-  const im = $("gImg").checked ? storyImg(item) : null;
+  let im = $("gImg").checked ? storyImg(item) : null;
+  if (!im && S.heroImg && S.heroImg.naturalWidth) im = S.heroImg;
   if (im) {
     x.save(); x.shadowColor = "rgba(0,0,0,.55)"; x.shadowBlur = 38; x.shadowOffsetY = 14;
     roundRect(x, R.x, R.y, R.w, R.h, 16); x.fillStyle = "#0B1A13"; x.fill(); x.restore();
@@ -1404,17 +1434,25 @@ function drawCaption(x) {
 
 /* --- main loop --- */
 let prev = performance.now();
-(function loop(t) {
+let paintErr = 0;
+function loop(t) {
   const dt = Math.min(0.05, (t - prev) / 1000); prev = t;
+  try {
   promptTick(dt);
   if (!S.openPreview) drawFrame(t);
   if (S.recording) {
     $("tc").textContent = fmtTC(elapsed());
     if (!S.paused && S.level > S.recPeak) S.recPeak = S.level;
   }
+  } catch (err) {
+    /* one bad frame must never take the whole program monitor down with it */
+    if (++paintErr === 1 || paintErr % 300 === 0) {
+      console.error("paint:", err);
+      $("pgmInfo").textContent = "paint error \u2014 " + (err.message || err);
+    }
+  }
   requestAnimationFrame(loop);
-})(performance.now());
-layoutPrompter();
+}
 
 /* ============================================================
    4. SEGMENT RECORDING
@@ -2443,6 +2481,8 @@ document.addEventListener("keydown", e => {
 
 /* boot */
 deskPaint();
+layoutPrompter();
+requestAnimationFrame(loop);
 renderRundown(); renderSegs(); setTransport("none");
 if (!HAS_GAS && !DESK.ready) $("deskAcc").open = true;
 if (HAS_GAS || DESK.ready) $("btnPull").click();
