@@ -444,13 +444,11 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
               <button class="btn sm" id="btnHeroClr">Clear</button></div>
             <p class="note" id="heroName">Nothing loaded — the big MV is showing. A story pulled from the rundown brings its own image and overrides this.</p></div>
           <label class="chk"><input type="checkbox" id="gBug" checked> Corner bug and date</label>
-          <div class="field" style="margin-top:10px"><label>Anchor position</label>
-            <div class="seg" id="segAnchor">
-              <button data-a="right" aria-pressed="true">Camera right</button>
-              <button data-a="center" aria-pressed="false">Center</button>
-              <button data-a="left" aria-pressed="false">Camera left</button>
-            </div>
-          </div>
+          <div class="field" style="margin-top:10px"><label>Anchor left / right <span class="n" id="axV">18</span>%</label>
+            <input type="range" id="ax" min="-45" max="45" value="18"></div>
+          <div class="field"><label>Anchor up / down <span class="n" id="ayV">0</span>%</label>
+            <input type="range" id="ay" min="-25" max="25" value="0"></div>
+          <label class="chk"><input type="checkbox" id="guides"> Show framing guides (preview only, never recorded)</label>
           <div class="field"><label>Anchor size <span class="n" id="szV">100</span>%</label>
             <input type="range" id="sz" min="70" max="130" value="100"></div>
           <div class="field"><label>Anchor brightness <span class="n" id="briV">100</span>%</label>
@@ -610,7 +608,7 @@ const S = {
   segs: [], armed: null, cd: 0, cdT0: 0, paused: false, pausedAt: 0, pausedTotal: 0, discard: false,
   stream: null, audioStream: null,
   mode: "ai", bgKey: "green", anchor: "right",
-  autoInv: false, invSum: 0, invN: 0, invDone: false,
+  autoInv: false, invSum: 0, invN: 0, invDone: false, maskOK: false,
   segmenter: null, aiReady: false, plate: null,
   rolling: false, scrollY: 0, lastRAF: 0,
   recording: false, recStart: 0, recCues: [], tstate: "none",
@@ -1161,10 +1159,8 @@ document.querySelectorAll("#segBg button").forEach(b => b.onclick = () => {
   S.bgKey = b.dataset.b;
   document.querySelectorAll("#segBg button").forEach(x => x.setAttribute("aria-pressed", x === b));
 });
-document.querySelectorAll("#segAnchor button").forEach(b => b.onclick = () => {
-  S.anchor = b.dataset.a;
-  document.querySelectorAll("#segAnchor button").forEach(x => x.setAttribute("aria-pressed", x === b));
-});
+$("ax").oninput = () => $("axV").textContent = $("ax").value;
+$("ay").oninput = () => $("ayV").textContent = $("ay").value;
 $("tol").oninput = () => $("tolV").textContent = $("tol").value;
 $("fth").oninput = () => $("fthV").textContent = $("fth").value;
 $("grow").oninput = () => $("growV").textContent = $("grow").value;
@@ -1379,11 +1375,20 @@ function drawFrame(ts) {
   if (S.stream && video.videoWidth) {
     const scale = (+$("sz").value) / 100;
     const vw = video.videoWidth, vh = video.videoHeight;
-    const k = Math.max(OUT_W / vw, OUT_H / vh) * scale;
+    const axf = (+$("ax").value) / 100, ayf = (+$("ay").value) / 100;
+    /* Sliding the source sideways used to walk the anchor off the edge. Zoom in by
+       however far we are panning, so the picture still covers the frame. */
+    const cover = Math.max(OUT_W / vw, OUT_H / vh);
+    /* With the background cut out, panning is free — only you get drawn, so the
+       edges of the source never show. With it off, the picture has to keep
+       covering the frame, which means zooming in by exactly twice the pan. */
+    const needCover = (S.mode === "off" || !S.maskOK);
+    const k = cover * scale * (needCover ? Math.max(1, 1 + 2 * Math.abs(axf)) : 1);
     const dw = vw * k, dh = vh * k;
-    const offs = { right: 0.30, center: 0, left: -0.30 }[S.anchor] * OUT_W;
-    const dx = (OUT_W - dw) / 2 + offs, dy = OUT_H - dh;
+    const dx = (OUT_W - dw) / 2 + axf * OUT_W;
+    const dy = OUT_H - dh + ayf * OUT_H;
     const mask = buildMask(ts);
+    S.maskOK = !!mask;
     if (mask && $("showMatte").checked) {
       x.fillStyle = "#000"; x.fillRect(0, 0, OUT_W, OUT_H);
       x.save(); x.translate(OUT_W, 0); x.scale(-1, 1);
@@ -1407,7 +1412,8 @@ function drawFrame(ts) {
       personX.restore();
       personX.filter = "none";
       personX.globalCompositeOperation = "source-over";
-      x.drawImage(personC, 0, 0);
+      personX.setTransform(1, 0, 0, 1, 0, 0);
+      x.drawImage(personC, 0, 0, OUT_W, OUT_H);
     } else {
       x.save(); x.filter = anchorFilter();
       x.translate(OUT_W, 0); x.scale(-1, 1);
@@ -1437,6 +1443,26 @@ function drawFrame(ts) {
 
   if ($("gCap").checked) drawCaption(x);
 
+  if (!S.recording && $("guides").checked) {
+    x.save();
+    x.strokeStyle = "rgba(143,224,176,.30)"; x.lineWidth = 1;
+    x.setLineDash([7, 7]);
+    for (let i = 1; i < 3; i++) {
+      x.beginPath(); x.moveTo(OUT_W * i / 3, 0); x.lineTo(OUT_W * i / 3, OUT_H); x.stroke();
+      x.beginPath(); x.moveTo(0, OUT_H * i / 3); x.lineTo(OUT_W, OUT_H * i / 3); x.stroke();
+    }
+    x.setLineDash([]);
+    x.strokeStyle = "rgba(255,194,75,.55)";
+    x.strokeRect(HERO.x, HERO.y, HERO.w, HERO.h);          // where the picture lives
+    x.strokeStyle = "rgba(143,224,176,.55)";
+    x.strokeRect(OUT_W * 0.55, OUT_H * 0.06, OUT_W * 0.40, OUT_H * 0.88);   // where you should sit
+    x.fillStyle = "rgba(143,224,176,.85)";
+    setType(x, 600, 15, "Inter,system-ui,sans-serif", 2);
+    x.fillText("ANCHOR", OUT_W * 0.55 + 8, OUT_H * 0.06 + 22);
+    x.fillStyle = "rgba(255,194,75,.85)";
+    x.fillText("PICTURE", HERO.x + 8, HERO.y + 22);
+    x.restore();
+  }
   if (S.recording && !S.paused) {
     x.fillStyle = "rgba(255,59,48,.92)"; x.beginPath(); x.arc(OUT_W - 30, 30, 9, 0, 7); x.fill();
   }
