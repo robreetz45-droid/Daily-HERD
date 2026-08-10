@@ -400,9 +400,17 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
               <button data-b="minimal" aria-pressed="false">Minimal</button>
             </div>
           </div>
-          <div class="field"><label>Edge feather <span class="n" id="fthV">3</span></label>
-            <input type="range" id="fth" min="0" max="10" value="3"></div>
+          <div class="field"><label>Grow edge <span class="n" id="growV">2</span> px
+            <span class="n">— push the cut outward so the backdrop stops eating your hairline</span></label>
+            <input type="range" id="grow" min="-3" max="6" value="2"></div>
+          <div class="field"><label>Edge tightness <span class="n" id="tgtV">50</span></label>
+            <input type="range" id="tgt" min="25" max="75" value="50"></div>
+          <div class="field"><label>Edge feather <span class="n" id="fthV">2</span></label>
+            <input type="range" id="fth" min="0" max="8" value="2"></div>
+          <label class="chk"><input type="checkbox" id="steady" checked> Steady matte — blend across frames so the edge stops crawling</label>
+          <label class="chk"><input type="checkbox" id="showMatte"> Show the matte instead of the picture</label>
           <label class="chk"><input type="checkbox" id="invert"> Invert mask (if the room stays and you disappear)</label>
+          <p class="note">If the green creeps over your head while you read, raise <b>Grow edge</b> a notch or two. Looking down at the prompter is the usual trigger — a higher read line keeps your chin up and the model happier.</p>
         </div>
       </details>
 
@@ -458,7 +466,14 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
               <option value="2500000">720p · 2.5 Mbps — richer</option>
               <option value="4000000">1080p · 4 Mbps — largest file</option>
             </select></div>
-          <button class="btn sm" id="btnRestart">Restart camera</button>
+          <div class="field"><label>Mic level <span class="n" id="micGainV">100</span>%</label>
+            <input type="range" id="micGain" min="0" max="300" value="100"></div>
+          <label class="chk"><input type="checkbox" id="audioProc" checked> Noise suppression &amp; echo cancellation</label>
+          <div class="row" style="margin-top:10px">
+            <button class="btn sm go" id="btnMicCheck" style="flex:1">Mic check — 3 seconds</button>
+            <button class="btn sm" id="btnRestart">Restart camera</button>
+          </div>
+          <p class="note" id="micStat">Press <b>Mic check</b>, say something, and it plays back what the recorder would capture. If the LEVEL bars up top never move, the microphone isn't reaching the page at all.</p>
         </div>
       </details>
     </div>
@@ -535,7 +550,7 @@ const S = {
   rolling: false, scrollY: 0, lastRAF: 0,
   recording: false, recStart: 0, recCues: [], tstate: "none",
   recorder: null, chunks: [], finalBlob: null, finalCues: [],
-  level: 0
+  level: 0, recPeak: 0, ac: null, micSrc: null, micGain: null, audioOut: null, analyser: null, meterRunning: false
 };
 
 /* ---------- tiny helpers ---------- */
@@ -859,16 +874,21 @@ async function startCamera() {
   try {
     const c = $("devCam").value, m = $("devMic").value;
     const hi = +$("qual").value >= 4000000;
+    const proc = $("audioProc").checked;
     if (S.stream) S.stream.getTracks().forEach(t => t.stop());
     S.stream = await navigator.mediaDevices.getUserMedia({
       video: { deviceId: c ? { exact: c } : undefined, width: { ideal: hi ? 1920 : 1280 }, height: { ideal: hi ? 1080 : 720 }, frameRate: { ideal: 30 } },
-      audio: { deviceId: m ? { exact: m } : undefined, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+      audio: { deviceId: m ? { exact: m } : undefined,
+               echoCancellation: proc, noiseSuppression: proc, autoGainControl: proc }
     });
     video.srcObject = S.stream; await video.play();
     $("camMsg").style.display = "none";
     if (!S.armed) armSlot(null); else setTransport("idle");
     $("pgmInfo").textContent = video.videoWidth + "×" + video.videoHeight;
-    listDevices(); meter();
+    listDevices();
+    await buildAudio();
+    if (!S.stream.getAudioTracks().length)
+      toast("The camera started but no microphone came with it. Check the Microphone dropdown.", true);
   } catch (e) {
     $("camMsg").innerHTML = '<h3>Camera blocked</h3><p>' + esc(camHelp(e)) + '</p>';
     $("camMsg").style.display = "flex";
@@ -896,27 +916,95 @@ async function listDevices() {
 }
 ["devCam","devMic"].forEach(i => $(i).onchange = startCamera);
 
-/* --- audio meter --- */
-function meter() {
+/* --- audio: one explicit graph, so what you hear is what gets recorded ---
+   mic -> gain -> [ MediaStreamDestination -> recorder ]
+                \-> analyser -> the LEVEL bars
+   Routing through a MediaStreamDestination rather than handing the raw track
+   to MediaRecorder means the level slider is real and the meter is proof. */
+function audioReady() { return !!(S.audioOut && S.audioOut.stream.getAudioTracks().length); }
+
+async function buildAudio() {
   try {
-    const ac = new (window.AudioContext || window.webkitAudioContext)();
-    const an = ac.createAnalyser(); an.fftSize = 512;
-    ac.createMediaStreamSource(S.stream).connect(an);
-    const buf = new Uint8Array(an.frequencyBinCount);
-    const bars = $("lvl").children;
-    (function loop() {
-      an.getByteTimeDomainData(buf);
-      let p = 0; for (const v of buf) p = Math.max(p, Math.abs(v - 128) / 128);
-      S.level = S.level * 0.7 + p * 0.3;
+    if (!S.stream || !S.stream.getAudioTracks().length) { S.audioOut = null; return; }
+    if (!S.ac) S.ac = new (window.AudioContext || window.webkitAudioContext)();
+    if (S.ac.state === "suspended") { try { await S.ac.resume(); } catch (e) {} }
+    if (S.micSrc) { try { S.micSrc.disconnect(); } catch (e) {} }
+    S.micSrc  = S.ac.createMediaStreamSource(S.stream);
+    S.micGain = S.micGain || S.ac.createGain();
+    S.audioOut = S.audioOut || S.ac.createMediaStreamDestination();
+    if (!S.analyser) { S.analyser = S.ac.createAnalyser(); S.analyser.fftSize = 512; }
+    S.micGain.gain.value = (+$("micGain").value) / 100;
+    S.micSrc.connect(S.micGain);
+    S.micGain.connect(S.audioOut);
+    S.micGain.connect(S.analyser);
+    if (!S.meterRunning) { S.meterRunning = true; meterLoop(); }
+  } catch (e) {
+    S.audioOut = null;
+    $("micStat").innerHTML = "<b style='color:var(--amber)'>Audio graph failed:</b> " + e.message +
+      " \u2014 the recorder will fall back to the raw microphone track.";
+  }
+}
+$("micGain").oninput = () => {
+  $("micGainV").textContent = $("micGain").value;
+  if (S.micGain) S.micGain.gain.value = (+$("micGain").value) / 100;
+};
+$("audioProc").onchange = startCamera;
+
+function meterLoop() {
+  const bars = $("lvl").children;
+  const buf = new Uint8Array(512);
+  (function loop() {
+    if (S.analyser) {
+      S.analyser.getByteTimeDomainData(buf);
+      let pk = 0; for (let i = 0; i < buf.length; i++) pk = Math.max(pk, Math.abs(buf[i] - 128) / 128);
+      S.level = S.level * 0.65 + pk * 0.35;
       for (let i = 0; i < bars.length; i++) {
         const on = S.level * bars.length > i;
         bars[i].style.height = on ? (20 + i * 8) + "%" : "18%";
         bars[i].style.background = on ? (i > 6 ? "var(--tally)" : i > 4 ? "var(--amber)" : "var(--shine)") : "var(--line2)";
       }
-      requestAnimationFrame(loop);
-    })();
-  } catch (e) {}
+    }
+    requestAnimationFrame(loop);
+  })();
 }
+
+/* three seconds in, three seconds back out — the only honest mic test */
+$("btnMicCheck").onclick = async () => {
+  if (!S.stream) return toast("Start the camera first.", true);
+  await buildAudio();
+  const tracks = audioReady() ? S.audioOut.stream.getAudioTracks() : S.stream.getAudioTracks();
+  if (!tracks.length) {
+    $("micStat").innerHTML = "<b style='color:var(--tally)'>No microphone track at all.</b> " +
+      "Pick a different device in the Microphone dropdown, then check Windows Settings \u2192 Privacy \u2192 Microphone " +
+      "and make sure your browser is allowed.";
+    return;
+  }
+  const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus"
+             : MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+  const rec = new MediaRecorder(new MediaStream(tracks), mime ? { mimeType: mime } : undefined);
+  const parts = []; rec.ondataavailable = e => e.data.size && parts.push(e.data);
+  let peak = 0;
+  const watch = setInterval(() => { peak = Math.max(peak, S.level); }, 60);
+  rec.onstop = () => {
+    clearInterval(watch);
+    const b = new Blob(parts, { type: mime || "audio/webm" });
+    const a = new Audio(URL.createObjectURL(b)); a.play();
+    $("micStat").innerHTML = peak > 0.02
+      ? "Captured " + Math.round(b.size / 1024) + " KB, peak level " + Math.round(peak * 100) +
+        "%. Playing it back now \u2014 if you hear yourself, recording will have sound."
+      : "<b style='color:var(--tally)'>Silence.</b> " + Math.round(b.size / 1024) + " KB but no signal. " +
+        "Try another device in the Microphone dropdown, raise Mic level, or untick noise suppression \u2014 " +
+        "some laptop drivers gate the mic to nothing with it on.";
+  };
+  rec.start();
+  $("micStat").textContent = "Recording three seconds \u2014 say something.";
+  setTimeout(() => rec.stop(), 3000);
+};
+
+/* browsers suspend audio until the page is touched */
+document.addEventListener("pointerdown", () => {
+  if (S.ac && S.ac.state === "suspended") S.ac.resume();
+}, { capture: true });
 
 /* --- AI cutout --- */
 (async function initAI() {
@@ -924,8 +1012,8 @@ function meter() {
     const v = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14");
     const fs = await v.FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
     S.segmenter = await v.ImageSegmenter.createFromOptions(fs, {
-      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite", delegate: "GPU" },
-      runningMode: "VIDEO", outputCategoryMask: true, outputConfidenceMasks: false
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter_landscape/float16/latest/selfie_segmenter_landscape.tflite", delegate: "GPU" },
+      runningMode: "VIDEO", outputCategoryMask: true, outputConfidenceMasks: true
     });
     S.aiReady = true;
     $("aiStat").innerHTML = "Cutout model loaded. Nothing else to do — stand anywhere.";
@@ -953,6 +1041,8 @@ document.querySelectorAll("#segAnchor button").forEach(b => b.onclick = () => {
 });
 $("tol").oninput = () => $("tolV").textContent = $("tol").value;
 $("fth").oninput = () => $("fthV").textContent = $("fth").value;
+$("grow").oninput = () => $("growV").textContent = $("grow").value;
+$("tgt").oninput = () => $("tgtV").textContent = $("tgt").value;
 $("sz").oninput = () => $("szV").textContent = $("sz").value;
 $("bri").oninput = () => $("briV").textContent = $("bri").value;
 $("con").oninput = () => $("conV").textContent = $("con").value;
@@ -968,17 +1058,35 @@ $("btnPlate").onclick = () => {
   toast("Room plate captured. Step back into frame.");
 };
 
-/* Sample the outer rim of the mask. A person doesn't touch all four edges;
+/* ------------------------------------------------------------------
+   The matte.  Every route — AI or plate key — produces a Float32Array
+   of alpha at mask resolution, then goes through the same finishing:
+   grow/shrink, temporal smoothing, and a feather on the way out.
+   ------------------------------------------------------------------ */
+let A = null, Aw = 0, Ah = 0, Atmp = null, Aprev = null;
+
+function ensureA(w, h) {
+  if (Aw !== w || Ah !== h) {
+    Aw = w; Ah = h;
+    A = new Float32Array(w * h); Atmp = new Float32Array(w * h); Aprev = null;
+  }
+}
+function smoothstep(e0, e1, v) {
+  const t = Math.min(1, Math.max(0, (v - e0) / (e1 - e0 || 1e-6)));
+  return t * t * (3 - 2 * t);
+}
+
+/* Sample the outer rim. A person doesn't touch all four edges of the frame;
    a background does. If the rim reads as "person", the labels are flipped. */
-function probeMask(arr, w, h) {
+function probeAlpha() {
   if (S.invDone) return;
-  const band = Math.max(2, Math.round(Math.min(w, h) * 0.06));
+  const band = Math.max(2, Math.round(Math.min(Aw, Ah) * 0.06));
   let rim = 0, hits = 0;
-  for (let y = 0; y < h; y++) {
-    const edgeRow = (y < band || y >= h - band);
-    for (let x = 0; x < w; x++) {
-      if (!edgeRow && x >= band && x < w - band) { x = w - band - 1; continue; }
-      rim++; if (arr[y * w + x] !== 0) hits++;
+  for (let y = 0; y < Ah; y++) {
+    const edgeRow = (y < band || y >= Ah - band);
+    for (let x = 0; x < Aw; x++) {
+      if (!edgeRow && x >= band && x < Aw - band) { x = Aw - band - 1; continue; }
+      rim++; if (A[y * Aw + x] > 0.5) hits++;
     }
   }
   S.invSum += hits / Math.max(1, rim);
@@ -990,43 +1098,91 @@ function probeMask(arr, w, h) {
       " If it ever keys out the wrong half, tick Invert mask.";
   }
 }
-function resetProbe() { S.invSum = 0; S.invN = 0; S.invDone = false; S.autoInv = false; }
+function resetProbe() { S.invSum = 0; S.invN = 0; S.invDone = false; S.autoInv = false; Aprev = null; }
+
+/* separable max (grow) or min (shrink) filter */
+function morph(radius) {
+  if (!radius) return;
+  const grow = radius > 0, r = Math.abs(radius) | 0;
+  const pick = grow ? Math.max : Math.min;
+  for (let y = 0; y < Ah; y++) {
+    const row = y * Aw;
+    for (let x = 0; x < Aw; x++) {
+      let v = A[row + x];
+      for (let k = 1; k <= r; k++) {
+        if (x - k >= 0) v = pick(v, A[row + x - k]);
+        if (x + k < Aw) v = pick(v, A[row + x + k]);
+      }
+      Atmp[row + x] = v;
+    }
+  }
+  for (let x = 0; x < Aw; x++) {
+    for (let y = 0; y < Ah; y++) {
+      let v = Atmp[y * Aw + x];
+      for (let k = 1; k <= r; k++) {
+        if (y - k >= 0) v = pick(v, Atmp[(y - k) * Aw + x]);
+        if (y + k < Ah) v = pick(v, Atmp[(y + k) * Aw + x]);
+      }
+      A[y * Aw + x] = v;
+    }
+  }
+}
+
+function finishMask() {
+  if ($("invert").checked !== S.autoInv) for (let i = 0; i < A.length; i++) A[i] = 1 - A[i];
+  const t = (+$("tgt").value) / 100, soft = 0.14;
+  for (let i = 0; i < A.length; i++) A[i] = smoothstep(t - soft, t + soft, A[i]);
+  morph(+$("grow").value);
+  if ($("steady").checked) {
+    if (!Aprev || Aprev.length !== A.length) Aprev = Float32Array.from(A);
+    else for (let i = 0; i < A.length; i++) A[i] = Aprev[i] = Aprev[i] * 0.45 + A[i] * 0.55;
+  } else Aprev = null;
+  if (maskC.width !== Aw) { maskC.width = Aw; maskC.height = Ah; }
+  const img = maskX.createImageData(Aw, Ah), d = img.data;
+  for (let i = 0, j = 0; i < A.length; i++, j += 4) {
+    d[j] = d[j+1] = d[j+2] = 255; d[j+3] = (A[i] * 255) | 0;
+  }
+  maskX.putImageData(img, 0, 0);
+  return maskC;
+}
 
 function buildMask(ts) {
   if (S.mode === "off") return null;
+
   if (S.mode === "ai" && S.aiReady && S.segmenter) {
     let res;
     try { res = S.segmenter.segmentForVideo(video, ts); } catch (e) { return null; }
-    const m = res && res.categoryMask; if (!m) return null;
-    const w = m.width, h = m.height, arr = m.getAsUint8Array();
-    if (maskC.width !== w) { maskC.width = w; maskC.height = h; }
-    probeMask(arr, w, h);
-    const img = maskX.createImageData(w, h), d = img.data;
-    const inv = ($("invert").checked !== S.autoInv);   // XOR: manual override on top of the probe
-    for (let i = 0, j = 0; i < arr.length; i++, j += 4) {
-      const person = inv ? arr[i] === 0 : arr[i] !== 0;
-      d[j] = d[j+1] = d[j+2] = 255; d[j+3] = person ? 255 : 0;
+    if (!res) return null;
+    const cm = res.confidenceMasks && res.confidenceMasks.length ? res.confidenceMasks[0] : null;
+    const km = res.categoryMask || null;
+    const src = cm || km;
+    if (!src) return null;
+    ensureA(src.width, src.height);
+    if (cm) {
+      const f = cm.getAsFloat32Array();
+      for (let i = 0; i < A.length; i++) A[i] = f[i];
+    } else {
+      const u = km.getAsUint8Array();
+      for (let i = 0; i < A.length; i++) A[i] = u[i] ? 1 : 0;
     }
-    maskX.putImageData(img, 0, 0);
-    m.close && m.close();
-    return maskC;
+    probeAlpha();
+    if (cm) cm.close && cm.close();
+    if (km) km.close && km.close();
+    return finishMask();
   }
+
   if (S.mode === "plate" && S.plate) {
     const w = smallC.width, h = smallC.height;
     smallX.drawImage(video, 0, 0, w, h);
-    const cur = smallX.getImageData(0, 0, w, h), p = S.plate.data, c = cur.data;
+    const cur = smallX.getImageData(0, 0, w, h), pl = S.plate.data, c = cur.data;
     const tol = +$("tol").value, tol2 = tol * tol * 3;
-    if (maskC.width !== w) { maskC.width = w; maskC.height = h; }
-    const img = maskX.createImageData(w, h), d = img.data;
-    const inv = $("invert").checked;
-    for (let j = 0; j < c.length; j += 4) {
-      const dr = c[j]-p[j], dg = c[j+1]-p[j+1], db = c[j+2]-p[j+2];
-      let person = (dr*dr + dg*dg + db*db) > tol2;
-      if (inv) person = !person;
-      d[j] = d[j+1] = d[j+2] = 255; d[j+3] = person ? 255 : 0;
+    ensureA(w, h);
+    S.autoInv = false; S.invDone = true;
+    for (let i = 0, j = 0; i < A.length; i++, j += 4) {
+      const dr = c[j] - pl[j], dg = c[j+1] - pl[j+1], db = c[j+2] - pl[j+2];
+      A[i] = Math.min(1, (dr*dr + dg*dg + db*db) / tol2);
     }
-    maskX.putImageData(img, 0, 0);
-    return maskC;
+    return finishMask();
   }
   return null;
 }
@@ -1051,7 +1207,11 @@ function drawFrame(ts) {
     const offs = { right: 0.30, center: 0, left: -0.30 }[S.anchor] * OUT_W;
     const dx = (OUT_W - dw) / 2 + offs, dy = OUT_H - dh;
     const mask = buildMask(ts);
-    if (mask) {
+    if (mask && $("showMatte").checked) {
+      x.fillStyle = "#000"; x.fillRect(0, 0, OUT_W, OUT_H);
+      x.save(); x.translate(OUT_W, 0); x.scale(-1, 1);
+      x.drawImage(mask, OUT_W - dx - dw, dy, dw, dh); x.restore();
+    } else if (mask) {
       personX.clearRect(0, 0, OUT_W, OUT_H);
       personX.save();
       personX.filter = anchorFilter();
@@ -1150,7 +1310,10 @@ let prev = performance.now();
   const dt = Math.min(0.05, (t - prev) / 1000); prev = t;
   promptTick(dt);
   if (!S.openPreview) drawFrame(t);
-  if (S.recording) $("tc").textContent = fmtTC(elapsed());
+  if (S.recording) {
+    $("tc").textContent = fmtTC(elapsed());
+    if (!S.paused && S.level > S.recPeak) S.recPeak = S.level;
+  }
   requestAnimationFrame(loop);
 })(performance.now());
 layoutPrompter();
@@ -1305,14 +1468,17 @@ function drawCountdown(x) {
 /* --- roll --- */
 function beginRec() {
   const cs = pv.captureStream(30);
-  S.stream.getAudioTracks().forEach(t => cs.addTrack(t));
+  if (S.ac && S.ac.state === "suspended") S.ac.resume();
+  const atracks = audioReady() ? S.audioOut.stream.getAudioTracks() : S.stream.getAudioTracks();
+  atracks.forEach(t => cs.addTrack(t));
+  if (!atracks.length) toast("Recording with no microphone — this segment will be silent. Run Mic check.", true);
   S.chunks = []; S.recCues = []; S.discard = false;
   S.paused = false; S.pausedTotal = 0; S.pausedAt = 0;
   S.recorder = new MediaRecorder(cs, { mimeType: pickMime(), videoBitsPerSecond: +$("qual").value, audioBitsPerSecond: 128000 });
   S.recorder.ondataavailable = e => e.data.size && S.chunks.push(e.data);
   S.recorder.onstop = onRecStop;
   S.recorder.start(1000);
-  S.recording = true; S.recStart = performance.now();
+  S.recording = true; S.recStart = performance.now(); S.recPeak = 0;
   S.rolling = true; $("btnRoll").textContent = "Pause";
   setTransport("rec");
   renderRundown();
@@ -1336,7 +1502,8 @@ function onRecStop() {
   S.armed = null;
   setTransport("none");
   renderSegs(); renderRundown();
-  toast("Segment saved — " + fmtDur(dur) + ".");
+  const quiet = S.recPeak < 0.02;
+  toast("Segment saved — " + fmtDur(dur) + (quiet ? ". No audio was detected — check the mic before recording more." : "."), quiet);
 }
 
 $("btnRec").onclick = startCountdown;
