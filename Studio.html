@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<script src="https://accounts.google.com/gsi/client" async></script>
 <style>
 :root{
   --ink:#08110D; --panel:#0E1C16; --panel2:#14261E; --line:#203A2E; --line2:#2C5344;
@@ -180,6 +181,11 @@ body.promptFull #promptCfg{display:none}
 .pip{position:fixed;top:14px;right:14px;width:210px;border-radius:8px;border:1px solid var(--line2);
   z-index:61;display:none;box-shadow:0 10px 30px rgba(0,0,0,.6)}
 body.promptFull .pip{display:block}
+#btnExitFull{display:none}
+body.promptFull #btnExitFull{display:inline-flex;position:fixed;top:14px;left:14px;z-index:62;
+  background:var(--tally);border-color:var(--tally);color:#fff}
+body.promptFull #btnExitFull:hover{background:#ff5348;color:#fff}
+body.promptFull .prompter-shell{cursor:grab}
 
 /* ---------- Takes strip ---------- */
 .takes{flex:0 0 auto;border-top:1px solid var(--line);background:var(--panel);max-height:246px;display:flex;flex-direction:column}
@@ -314,12 +320,13 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
 
   <!-- ============ PROMPTER + LOOK ============ -->
   <section class="col prompter-col">
-    <div class="hd">Teleprompter <span class="n"><kbd>Space</kbd> roll · <kbd>↑↓</kbd> speed · <kbd>F</kbd> full</span></div>
+    <div class="hd">Teleprompter <span class="n"><kbd>Space</kbd> roll · <kbd>↑↓</kbd> speed · <kbd>F</kbd> full · <kbd>Esc</kbd> out · scroll or drag to move</span></div>
     <div class="prompter-shell">
       <div class="fade-t"></div><div class="readline" id="readline"></div><div class="fade-b"></div>
       <div id="prompter"><div id="promptInner"></div></div>
     </div>
     <canvas class="pip" id="pip" width="320" height="180"></canvas>
+    <button class="btn sm" id="btnExitFull">Exit full screen &nbsp;<kbd>Esc</kbd></button>
     <div id="promptCfg">
       <details class="acc" open>
         <summary>Prompter</summary>
@@ -415,6 +422,28 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
           </div>
           <div class="field"><label>Anchor size <span class="n" id="szV">100</span>%</label>
             <input type="range" id="sz" min="70" max="130" value="100"></div>
+          <div class="field"><label>Anchor brightness <span class="n" id="briV">100</span>%</label>
+            <input type="range" id="bri" min="60" max="200" value="100"></div>
+          <div class="field"><label>Anchor contrast <span class="n" id="conV">100</span>%</label>
+            <input type="range" id="con" min="70" max="160" value="100"></div>
+          <p class="note">Overhead office lights make a webcam expose for the ceiling and turn you into a silhouette. Lift brightness here, and put a lamp on your face if you can.</p>
+        </div>
+      </details>
+
+      <details class="acc" id="deskAcc">
+        <summary>The HERD desk</summary>
+        <div class="pad">
+          <p class="note" id="deskState" style="margin-top:0"></p>
+          <div class="field" style="margin-top:10px"><label>Desk address <span class="n">the /exec url of your SUBMIT deployment</span></label>
+            <input type="text" id="deskUrl" placeholder="https://script.google.com/.../exec"></div>
+          <div class="field"><label>Desk token <span class="n">printed by setup()</span></label>
+            <input type="text" id="deskToken" placeholder="paste the DESK TOKEN"></div>
+          <div class="row"><button class="btn sm go" id="deskSave" style="flex:1">Save &amp; connect</button>
+            <button class="btn sm" id="deskClear">Forget</button></div>
+          <p class="note">Stored on this computer only. Do it once per machine.</p>
+          <div class="field" style="margin-top:14px"><label>YouTube client ID <span class="n">optional — turns on one-click publishing</span></label>
+            <input type="text" id="ytClient" placeholder="....apps.googleusercontent.com"></div>
+          <p class="note">Leave this blank and you download the video and upload it at studio.youtube.com. The 11:31 staff note still goes out on its own either way.</p>
         </div>
       </details>
 
@@ -501,6 +530,7 @@ const S = {
   segs: [], armed: null, cd: 0, cdT0: 0, paused: false, pausedAt: 0, pausedTotal: 0, discard: false,
   stream: null, audioStream: null,
   mode: "ai", bgKey: "green", anchor: "right",
+  autoInv: false, invSum: 0, invN: 0, invDone: false,
   segmenter: null, aiReady: false, plate: null,
   rolling: false, scrollY: 0, lastRAF: 0,
   recording: false, recStart: 0, recCues: [], tstate: "none",
@@ -510,6 +540,10 @@ const S = {
 
 /* ---------- tiny helpers ---------- */
 const $ = id => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("herd:" + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem("herd:" + k, JSON.stringify(v)); } catch (e) {} }
+};
 const el = (t, c) => { const e = document.createElement(t); if (c) e.className = c; return e; };
 function toast(msg, bad) {
   const t = $("toast"); t.textContent = msg; t.className = "toast show" + (bad ? " bad" : "");
@@ -526,6 +560,49 @@ $("mDate").textContent = today();
 $("rdDate").textContent = new Date().toLocaleDateString(undefined,{month:"short",day:"numeric"});
 for (let i = 0; i < 9; i++) $("lvl").appendChild(el("i"));
 $("tallyLogo").src = BUG;
+
+/* ============================================================
+   0b. THE DESK — reaching the spreadsheet from outside Apps Script
+   ============================================================ */
+const DESK = {
+  get url()    { return store.get("deskUrl", ""); },
+  get token()  { return store.get("deskToken", ""); },
+  get client() { return store.get("ytClient", ""); },
+  get ready()  { return !!(this.url && this.token); }
+};
+function deskPaint() {
+  $("deskUrl").value = DESK.url; $("deskToken").value = DESK.token; $("ytClient").value = DESK.client;
+  const st = $("deskState");
+  if (HAS_GAS) st.innerHTML = "Running inside Apps Script — the desk is already wired up.";
+  else if (DESK.ready) st.innerHTML = "<b style='color:var(--shine)'>Connected.</b> Pull today brings in whatever staff submitted.";
+  else st.innerHTML = "<b style='color:var(--amber)'>Not connected.</b> Paste the two values below and the rundown, scripts and images arrive on their own.";
+}
+$("deskSave").onclick = () => {
+  store.set("deskUrl", $("deskUrl").value.trim().replace(/\?.*$/, ""));
+  store.set("deskToken", $("deskToken").value.trim());
+  store.set("ytClient", $("ytClient").value.trim());
+  deskPaint();
+  if (DESK.ready) $("btnPull").click(); else toast("Both the address and the token are needed.", true);
+};
+$("deskClear").onclick = () => {
+  ["deskUrl", "deskToken", "ytClient"].forEach(k => store.set(k, ""));
+  deskPaint(); toast("Desk details cleared from this computer.");
+};
+
+/* JSONP, because a script tag is the one thing Apps Script will answer
+   cross-origin without a preflight it can't send headers for. */
+let jsonpN = 0;
+function deskGet(params, ok, fail) {
+  const cb = "herdCB" + (++jsonpN);
+  const t = setTimeout(() => { cleanup(); fail && fail(new Error("The desk didn't answer. Check the address, and that the deployment is set to Anyone.")); }, 15000);
+  function cleanup() { clearTimeout(t); delete window[cb]; sc.remove(); }
+  window[cb] = r => { cleanup(); r && r.ok ? ok(r.items) : fail && fail(new Error(r && r.error || "refused")); };
+  const q = Object.assign({ token: DESK.token, cb: cb }, params);
+  const sc = document.createElement("script");
+  sc.src = DESK.url + "?" + Object.keys(q).map(k => k + "=" + encodeURIComponent(q[k])).join("&");
+  sc.onerror = () => { cleanup(); fail && fail(new Error("Couldn't reach the desk address.")); };
+  document.body.appendChild(sc);
+}
 
 /* ============================================================
    1. RUNDOWN
@@ -588,7 +665,21 @@ function editStory(i) {
 }
 $("btnAddStory").onclick = () => editStory(S.items.length);
 
+function loadItems(rows, note) {
+  S.items = (rows || []).map(r => ({
+    id: r.id, slug: r.slug, org: r.org, submitter: r.submitter,
+    script: r.script, image: r.imageDataUrl || "", on: true
+  }));
+  notice(S.items.length ? "" : (note || "Nothing approved for today yet."), "good");
+  renderRundown(); buildScript(); renderSegs();
+}
 $("btnPull").onclick = () => {
+  if (!HAS_GAS && DESK.ready) {
+    notice("Pulling today's submissions\u2026");
+    return deskGet({ action: "rundown" },
+      rows => loadItems(rows),
+      e => notice("Couldn't reach the HERD desk: " + e.message));
+  }
   if (HAS_GAS) {
     notice("Pulling today's submissions…");
     google.script.run
@@ -604,7 +695,7 @@ $("btnPull").onclick = () => {
       .getRundown();
   } else {
     S.items = DEMO.map(d => ({ ...d, on: true }));
-    notice("Standalone mode — showing sample stories so you can test the studio.", "good");
+    notice("Not connected to the desk \u2014 showing sample stories. Open \u201cThe HERD desk\u201d to wire it up.", "good");
     renderRundown(); buildScript(); renderSegs();
   }
 };
@@ -664,6 +755,38 @@ function loadPrompter() {
   rewind();
   if (S.armed) jumpTo(S.armed.key);
 }
+/* Scroll wheel and drag move the prompter, rolling or not. Scrolling back past the
+   read line un-times those words so a re-read produces correct captions. */
+function nudge(dy) {
+  S.scrollY = Math.max(0, S.scrollY + dy);
+  $("promptInner").style.transform = "translateY(" + (-S.scrollY) + "px)";
+  const shell = $("prompter").getBoundingClientRect();
+  const lineY = shell.top + shell.height * (+$("rl").value / 100);
+  let undone = 0;
+  for (let i = S.words.length - 1; i >= 0; i--) {
+    const w = S.words[i];
+    if (w.t == null || w.t < 0) continue;
+    const r = w.el.getBoundingClientRect();
+    if (r.bottom > lineY) { w.t = null; w.el.className = ""; undone++; } else break;
+  }
+  if (undone && S.recording) S.recCues.splice(Math.max(0, S.recCues.length - undone));
+}
+(function mousePrompter() {
+  const shell = document.querySelector(".prompter-shell");
+  shell.addEventListener("wheel", e => { e.preventDefault(); nudge(e.deltaY * 0.75); }, { passive: false });
+  let drag = null;
+  shell.style.cursor = "grab";
+  shell.addEventListener("pointerdown", e => {
+    drag = e.clientY; shell.setPointerCapture(e.pointerId); shell.style.cursor = "grabbing";
+  });
+  shell.addEventListener("pointermove", e => {
+    if (drag == null) return;
+    nudge(drag - e.clientY); drag = e.clientY;
+  });
+  const up = e => { drag = null; shell.style.cursor = "grab"; };
+  shell.addEventListener("pointerup", up); shell.addEventListener("pointercancel", up);
+})();
+
 function rewind() {
   S.scrollY = 0; S.rolling = false;
   S.words.forEach(w => { w.t = null; w.el.className = ""; });
@@ -753,7 +876,7 @@ async function startCamera() {
 }
 function camHelp(e) {
   const n = e && e.name;
-  if (n === "NotAllowedError") return "The browser denied camera access. Click the camera icon in the address bar, choose Allow, and reload. If this page is running inside Google Apps Script and the permission prompt never appears, open the standalone Studio file instead — Apps Script's iframe blocks camera on some builds.";
+  if (n === "NotAllowedError") return "The browser denied camera access. If you see a camera icon in the address bar, click it, choose Allow, and reload. If no prompt ever appeared, this page is running inside an iframe that blocks the camera \u2014 Apps Script does this. Host the studio on its own https address instead; see section 3 of SETUP.";
   if (n === "NotFoundError") return "No camera found. Plug one in, then press Restart camera.";
   if (n === "NotReadableError") return "Another app is holding the camera. Quit Zoom, Meet or Teams and try again.";
   return "Couldn't start the camera: " + (e && e.message || e);
@@ -831,12 +954,43 @@ document.querySelectorAll("#segAnchor button").forEach(b => b.onclick = () => {
 $("tol").oninput = () => $("tolV").textContent = $("tol").value;
 $("fth").oninput = () => $("fthV").textContent = $("fth").value;
 $("sz").oninput = () => $("szV").textContent = $("sz").value;
+$("bri").oninput = () => $("briV").textContent = $("bri").value;
+$("con").oninput = () => $("conV").textContent = $("con").value;
+function anchorFilter() {
+  const b = +$("bri").value, c = +$("con").value;
+  return (b === 100 && c === 100) ? "none" : "brightness(" + b + "%) contrast(" + c + "%)";
+}
+document.querySelectorAll("#segMode button").forEach(b => b.addEventListener("click", resetProbe));
 $("btnPlate").onclick = () => {
   if (!S.stream) return toast("Start the camera first.", true);
   smallX.drawImage(video, 0, 0, smallC.width, smallC.height);
   S.plate = smallX.getImageData(0, 0, smallC.width, smallC.height);
   toast("Room plate captured. Step back into frame.");
 };
+
+/* Sample the outer rim of the mask. A person doesn't touch all four edges;
+   a background does. If the rim reads as "person", the labels are flipped. */
+function probeMask(arr, w, h) {
+  if (S.invDone) return;
+  const band = Math.max(2, Math.round(Math.min(w, h) * 0.06));
+  let rim = 0, hits = 0;
+  for (let y = 0; y < h; y++) {
+    const edgeRow = (y < band || y >= h - band);
+    for (let x = 0; x < w; x++) {
+      if (!edgeRow && x >= band && x < w - band) { x = w - band - 1; continue; }
+      rim++; if (arr[y * w + x] !== 0) hits++;
+    }
+  }
+  S.invSum += hits / Math.max(1, rim);
+  if (++S.invN >= 12) {
+    S.autoInv = (S.invSum / S.invN) > 0.55;
+    S.invDone = true;
+    $("aiStat").innerHTML = "Cutout model loaded and calibrated" +
+      (S.autoInv ? " (labels were flipped \u2014 corrected)." : ".") +
+      " If it ever keys out the wrong half, tick Invert mask.";
+  }
+}
+function resetProbe() { S.invSum = 0; S.invN = 0; S.invDone = false; S.autoInv = false; }
 
 function buildMask(ts) {
   if (S.mode === "off") return null;
@@ -846,8 +1000,9 @@ function buildMask(ts) {
     const m = res && res.categoryMask; if (!m) return null;
     const w = m.width, h = m.height, arr = m.getAsUint8Array();
     if (maskC.width !== w) { maskC.width = w; maskC.height = h; }
+    probeMask(arr, w, h);
     const img = maskX.createImageData(w, h), d = img.data;
-    const inv = $("invert").checked;
+    const inv = ($("invert").checked !== S.autoInv);   // XOR: manual override on top of the probe
     for (let i = 0, j = 0; i < arr.length; i++, j += 4) {
       const person = inv ? arr[i] === 0 : arr[i] !== 0;
       d[j] = d[j+1] = d[j+2] = 255; d[j+3] = person ? 255 : 0;
@@ -899,9 +1054,11 @@ function drawFrame(ts) {
     if (mask) {
       personX.clearRect(0, 0, OUT_W, OUT_H);
       personX.save();
+      personX.filter = anchorFilter();
       personX.translate(OUT_W, 0); personX.scale(-1, 1);          // mirror for natural anchor view
       personX.drawImage(video, OUT_W - dx - dw, dy, dw, dh);
       personX.restore();
+      personX.filter = "none";
       personX.globalCompositeOperation = "destination-in";
       const f = +$("fth").value;
       personX.filter = f ? "blur(" + f + "px)" : "none";
@@ -913,8 +1070,9 @@ function drawFrame(ts) {
       personX.globalCompositeOperation = "source-over";
       x.drawImage(personC, 0, 0);
     } else {
-      x.save(); x.translate(OUT_W, 0); x.scale(-1, 1);
-      x.drawImage(video, OUT_W - dx - dw, dy, dw, dh); x.restore();
+      x.save(); x.filter = anchorFilter();
+      x.translate(OUT_W, 0); x.scale(-1, 1);
+      x.drawImage(video, OUT_W - dx - dw, dy, dw, dh); x.restore(); x.filter = "none";
     }
   }
 
@@ -1300,13 +1458,15 @@ function download(blob, name) {
    5. ASSEMBLE + CAPTIONS + PUBLISH
    ============================================================ */
 $("btnFull").onclick = () => document.body.classList.toggle("promptFull");
+$("btnExitFull").onclick = () => document.body.classList.remove("promptFull");
 $("btnAssemble").onclick = () => {
   $("ytTitle").value = "The Daily HERD — " + today();
   $("ytDesc").value = "Morning announcements from Mounds View High School. One HERD: health & well-being, engagement, relationships, dignity.\n\nSubmit something for the Daily HERD: [paste your submission link here]";
   $("pubModal").classList.add("open");
-  $("ytNote").innerHTML = HAS_GAS ? "" :
-    "Running standalone, so the YouTube button is off. Assemble, download the video and captions, and upload them at studio.youtube.com — or run this Studio from the Apps Script deployment to publish in one click.";
-  $("btnYT").disabled = !HAS_GAS;
+  $("ytNote").innerHTML = (HAS_GAS || DESK.client) ? "" :
+    "No YouTube client ID set, so publishing is manual: assemble, download the video and captions, then upload at studio.youtube.com. The 11:31 staff note still goes out on its own \u2014 the desk finds the day's video on your channel.";
+  $("btnYT").disabled = !(HAS_GAS || DESK.client);
+  $("btnYT").textContent = HAS_GAS ? "3 \u00b7 Send to YouTube" : "3 \u00b7 Sign in & send to YouTube";
 };
 $("pubClose").onclick = () => $("pubModal").classList.remove("open");
 function plog(m) { const l = $("pubLog"); l.textContent += "\n" + m; l.scrollTop = l.scrollHeight; }
@@ -1846,10 +2006,16 @@ $("btnYT").onclick = async () => {
   if (!S.finalBlob) return toast("Assemble the show first.", true);
   $("btnYT").disabled = true;
   try {
-    plog("Asking the HERD desk for an upload pass…");
-    const auth = await new Promise((ok, no) =>
-      google.script.run.withSuccessHandler(ok).withFailureHandler(no).getUploadToken());
-    const token = auth.token;
+    let token, auth = { canPublish: true };
+    if (HAS_GAS) {
+      plog("Asking the HERD desk for an upload pass\u2026");
+      auth = await new Promise((ok, no) =>
+        google.script.run.withSuccessHandler(ok).withFailureHandler(no).getUploadToken());
+      token = auth.token;
+    } else {
+      plog("Signing in to YouTube\u2026");
+      token = await gisToken();
+    }
     if (!auth.canPublish) {                       // not the channel owner — queue it in Drive
       plog("You're signed in as " + auth.email + ", which doesn't own the channel. Sending to the Drive queue instead.");
       const name = "daily-herd-" + new Date().toISOString().slice(0,10) + ".webm";
@@ -1884,14 +2050,49 @@ $("btnYT").onclick = async () => {
     plog("Video is up: https://youtu.be/" + id);
     google.script.run.withFailureHandler(e => plog("Couldn't log the show: " + e.message))
       .logPublished(id, $("ytTitle").value, chapterList(S.finalCues));
-    plog("Attaching captions…");
-    await google.script.run.withSuccessHandler(() => plog("Captions attached."))
-      .withFailureHandler(e => plog("Captions didn't attach — upload the .srt by hand: " + e.message))
-      .uploadCaptions(id, toSRT(S.finalCues));
+    plog("Attaching captions\u2026");
+    if (HAS_GAS) {
+      google.script.run.withSuccessHandler(() => plog("Captions attached."))
+        .withFailureHandler(e => plog("Captions didn't attach \u2014 upload the .srt by hand: " + e.message))
+        .uploadCaptions(id, toSRT(S.finalCues));
+    } else {
+      await putCaptions(token, id, toSRT(S.finalCues));
+    }
     toast("Published to YouTube.");
   } catch (e) { plog("Failed: " + e.message); toast("Publish failed — see the log.", true); }
   $("btnYT").disabled = false;
 };
+
+/* Google Identity Services — only used when the studio is hosted outside Apps Script */
+let gisClient = null;
+function gisToken() {
+  return new Promise((ok, no) => {
+    if (!DESK.client) return no(new Error("No YouTube client ID saved. Open \u201cThe HERD desk\u201d to add one."));
+    if (!window.google || !google.accounts || !google.accounts.oauth2)
+      return no(new Error("Google sign-in didn't load. Check the network and reload."));
+    gisClient = gisClient || google.accounts.oauth2.initTokenClient({
+      client_id: DESK.client,
+      scope: "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.force-ssl",
+      callback: () => {}
+    });
+    gisClient.callback = r => r && r.access_token ? ok(r.access_token) : no(new Error(r && r.error || "sign-in cancelled"));
+    gisClient.requestAccessToken();
+  });
+}
+async function putCaptions(token, videoId, srt) {
+  const boundary = "herd" + Date.now();
+  const meta = { snippet: { videoId, language: "en", name: "English", isDraft: false } };
+  const body =
+    "--" + boundary + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" +
+    JSON.stringify(meta) + "\r\n--" + boundary +
+    "\r\nContent-Type: application/octet-stream\r\n\r\n" + srt + "\r\n--" + boundary + "--\r\n";
+  const r = await fetch("https://www.googleapis.com/upload/youtube/v3/captions?part=snippet&uploadType=multipart", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + token, "Content-Type": "multipart/related; boundary=" + boundary },
+    body
+  });
+  plog(r.ok ? "Captions attached." : "Captions didn't attach \u2014 upload the .srt by hand.");
+}
 
 async function driveResumable(token, folderId, name, blob) {
   const init = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable", {
@@ -1928,9 +2129,12 @@ document.addEventListener("keydown", e => {
 });
 
 /* boot */
+deskPaint();
 renderRundown(); renderSegs(); setTransport("none");
-if (HAS_GAS) $("btnPull").click();
+if (!HAS_GAS && !DESK.ready) $("deskAcc").open = true;
+if (HAS_GAS || DESK.ready) $("btnPull").click();
 navigator.mediaDevices && navigator.mediaDevices.enumerateDevices && listDevices();
 </script>
 </body>
 </html>
+
