@@ -397,6 +397,15 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
       <details class="acc">
         <summary>Background</summary>
         <div class="pad">
+          <div class="field"><label>Look</label>
+            <div class="seg" id="segLook">
+              <button data-l="window" aria-pressed="true">Window</button>
+              <button data-l="cutout" aria-pressed="false">Cutout</button>
+              <button data-l="blur" aria-pressed="false">Blur</button>
+            </div>
+            <p class="note"><b>Window</b> puts the camera in a framed panel on the brand background — no matte, so no wavy edge, ever. <b>Cutout</b> removes the room. <b>Blur</b> keeps your room but throws it out of focus, which hides matte errors far better than a hard cut.</p>
+          </div>
+          <div id="matteBox">
           <div class="field"><label>Cutout method</label>
             <div class="seg" id="segMode">
               <button data-m="ai" aria-pressed="true">AI cutout</button>
@@ -430,6 +439,10 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
           <label class="chk"><input type="checkbox" id="steady" checked> Steady matte — blend across frames so the edge stops crawling</label>
           <label class="chk"><input type="checkbox" id="showMatte"> Show the matte instead of the picture</label>
           <label class="chk"><input type="checkbox" id="invert"> Invert mask (if the room stays and you disappear)</label>
+          <div class="field" style="margin-top:10px"><label>Contour smoothing <span class="n" id="smoV">3</span>
+            <span class="n">— the fix for a wavy outline</span></label>
+            <input type="range" id="smo" min="0" max="8" value="3"></div>
+          </div>
           <p class="note">If the green creeps over your head while you read, raise <b>Grow edge</b> a notch or two. Looking down at the prompter is the usual trigger — a higher read line keeps your chin up and the model happier.</p>
         </div>
       </details>
@@ -437,7 +450,8 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
       <details class="acc">
         <summary>Graphics</summary>
         <div class="pad">
-          <label class="chk"><input type="checkbox" id="gCap" checked> Burn captions into the video</label>
+          <label class="chk"><input type="checkbox" id="gCap"> Burn captions into the video</label>
+          <p class="note">Off is the better default. YouTube writes its own captions from what was actually said, timed to the audio rather than to the prompter, and you can fix any word in YouTube Studio. Burned-in text can never be corrected.</p>
           <label class="chk"><input type="checkbox" id="gLower" checked> Lower third with story + group</label>
           <label class="chk"><input type="checkbox" id="gImg" checked> Put the story's image where the big MV sits</label>
           <div class="field" style="margin-top:10px"><label>Image on screen right now</label>
@@ -520,6 +534,8 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
         <select id="ytPriv"><option value="unlisted">Unlisted — link only</option>
           <option value="public">Public</option><option value="private">Private</option></select></div>
       <label class="chk"><input type="checkbox" id="ytKids" checked> Made for kids / audience is students</label>
+      <label class="chk"><input type="checkbox" id="ytCaps"> Attach the prompter captions to YouTube</label>
+      <p class="note" style="margin:2px 0 0">Leave that off and YouTube transcribes the audio itself, then you can correct any word in YouTube Studio. Attaching a file blocks that.</p>
       <div id="review" style="display:none;margin-top:14px">
         <label style="display:block;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--mist-dim);margin-bottom:5px">Review the assembled show</label>
         <video id="revVid" controls style="width:100%;border-radius:10px;border:1px solid var(--line2);background:#000"></video>
@@ -609,7 +625,7 @@ const S = {
   words: [],            // {el, itemIdx, text, t}
   segs: [], armed: null, cd: 0, cdT0: 0, paused: false, pausedAt: 0, pausedTotal: 0, discard: false,
   stream: null, audioStream: null,
-  mode: "ai", bgKey: "green", anchor: "right",
+  mode: "ai", look: "window", bgKey: "green", anchor: "right",
   autoInv: false, invSum: 0, invN: 0, invDone: false, maskOK: false,
   segmenter: null, aiReady: false, plate: null,
   rolling: false, scrollY: 0, lastRAF: 0,
@@ -654,15 +670,32 @@ function deskPaint() {
   $("deskUrl").value = DESK.url; $("deskToken").value = DESK.token; $("ytClient").value = DESK.client;
   const st = $("deskState");
   if (HAS_GAS) st.innerHTML = "Running inside Apps Script — the desk is already wired up.";
-  else if (DESK.ready) st.innerHTML = "<b style='color:var(--shine)'>Connected.</b> Pull today brings in whatever staff submitted.";
+  else if (DESK.ready) st.innerHTML = "<b style='color:var(--shine)'>Saved.</b> Press Pull today \u2014 the banner over the rundown will say if the desk answered.";
   else st.innerHTML = "<b style='color:var(--amber)'>Not connected.</b> Paste the two values below and the rundown, scripts and images arrive on their own.";
 }
+function deskUrlProblem(u) {
+  if (!u) return "Paste the /exec address of your Submit deployment.";
+  if (/docs\.google\.com\/spreadsheets/.test(u))
+    return "That is the spreadsheet, not the web app. In Apps Script press Deploy \u2192 Manage deployments and copy the Web app URL \u2014 it ends in /exec.";
+  if (/\/dev(\?|$)/.test(u))
+    return "That is the test address. It only answers when you are signed in, so the studio cannot use it. Use the /exec address instead.";
+  if (!/script\.google\.com\/.*\/exec$/.test(u.replace(/\?.*$/, "")))
+    return "That does not look like an Apps Script web app address. It should start with script.google.com and end in /exec.";
+  return null;
+}
 $("deskSave").onclick = () => {
-  store.set("deskUrl", $("deskUrl").value.trim().replace(/\?.*$/, ""));
+  const raw = $("deskUrl").value.trim().replace(/\?.*$/, "");
+  const bad = deskUrlProblem(raw);
+  if (bad) { $("deskState").innerHTML = "<b style='color:var(--tally)'>" + esc(bad) + "</b>"; return; }
+  store.set("deskUrl", raw);
   store.set("deskToken", $("deskToken").value.trim());
   store.set("ytClient", $("ytClient").value.trim());
+  if (!$("deskToken").value.trim()) {
+    $("deskState").innerHTML = "<b style='color:var(--tally)'>The token is missing. Run setup() in Apps Script and copy the line labelled DESK TOKEN.</b>";
+    return;
+  }
   deskPaint();
-  if (DESK.ready) $("btnPull").click(); else toast("Both the address and the token are needed.", true);
+  $("btnPull").click();
 };
 $("deskClear").onclick = () => {
   ["deskUrl", "deskToken", "ytClient"].forEach(k => store.set(k, ""));
@@ -805,7 +838,9 @@ $("btnPull").onclick = () => {
     notice("Pulling today's submissions\u2026");
     return deskGet({ action: "rundown" },
       rows => loadItems(rows),
-      e => notice("Couldn't reach the HERD desk: " + e.message));
+      e => notice("The desk did not answer: " + e.message +
+        "  \u2014 check that the address ends in /exec, that the deployment is set to Execute as: Me and Anyone, " +
+        "and that you published a NEW VERSION after pasting the latest Code.gs."));
   }
   if (HAS_GAS) {
     notice("Pulling today's submissions…");
@@ -1157,6 +1192,13 @@ function setMode(m) {
   $("plateBox").style.display = m === "plate" ? "" : "none";
 }
 document.querySelectorAll("#segMode button").forEach(b => b.onclick = () => setMode(b.dataset.m));
+function setLook(l) {
+  S.look = l;
+  document.querySelectorAll("#segLook button").forEach(b => b.setAttribute("aria-pressed", b.dataset.l === l));
+  $("matteBox").style.display = (l === "window") ? "none" : "";
+}
+document.querySelectorAll("#segLook button").forEach(b => b.onclick = () => setLook(b.dataset.l));
+$("smo").oninput = () => $("smoV").textContent = $("smo").value;
 document.querySelectorAll("#segBg button").forEach(b => b.onclick = () => {
   S.bgKey = b.dataset.b;
   document.querySelectorAll("#segBg button").forEach(x => x.setAttribute("aria-pressed", x === b));
@@ -1252,8 +1294,35 @@ function morph(radius) {
   }
 }
 
+/* A 256-wide mask stretched to 1080 lines has a jagged, crawling contour. Blurring
+   the alpha *before* thresholding turns that staircase into a smooth curve — far
+   better than blurring the finished edge, which just makes it muddy. */
+function blurA(radius) {
+  if (!radius) return;
+  const r = radius | 0, n = 2 * r + 1;
+  for (let y = 0; y < Ah; y++) {
+    const row = y * Aw; let acc = 0;
+    for (let k = -r; k <= r; k++) acc += A[row + Math.min(Aw - 1, Math.max(0, k))];
+    for (let x = 0; x < Aw; x++) {
+      Atmp[row + x] = acc / n;
+      acc -= A[row + Math.min(Aw - 1, Math.max(0, x - r))];
+      acc += A[row + Math.min(Aw - 1, Math.max(0, x + r + 1))];
+    }
+  }
+  for (let x = 0; x < Aw; x++) {
+    let acc = 0;
+    for (let k = -r; k <= r; k++) acc += Atmp[Math.min(Ah - 1, Math.max(0, k)) * Aw + x];
+    for (let y = 0; y < Ah; y++) {
+      A[y * Aw + x] = acc / n;
+      acc -= Atmp[Math.min(Ah - 1, Math.max(0, y - r)) * Aw + x];
+      acc += Atmp[Math.min(Ah - 1, Math.max(0, y + r + 1)) * Aw + x];
+    }
+  }
+}
+
 function finishMask() {
   if ($("invert").checked !== S.autoInv) for (let i = 0; i < A.length; i++) A[i] = 1 - A[i];
+  blurA(+$("smo").value);
   const t = (+$("tgt").value) / 100, soft = 0.14;
   for (let i = 0; i < A.length; i++) A[i] = smoothstep(t - soft, t + soft, A[i]);
   morph(+$("grow").value);
@@ -1309,6 +1378,34 @@ function buildMask(ts) {
     return finishMask();
   }
   return null;
+}
+
+/* The window look: no matte at all. The camera sits in a framed panel on the brand
+   background, which is what most broadcast graphics packages actually do. */
+const WIN = { x: 700, y: 92, w: 520, h: 536 };
+function drawWindow(x) {
+  const R = WIN;
+  x.save();
+  x.shadowColor = "rgba(0,0,0,.55)"; x.shadowBlur = 40; x.shadowOffsetY = 16;
+  roundRect(x, R.x, R.y, R.w, R.h, 18); x.fillStyle = "#0B1A13"; x.fill();
+  x.restore();
+
+  x.save();
+  roundRect(x, R.x + 5, R.y + 5, R.w - 10, R.h - 10, 14); x.clip();
+  const iw = R.w - 10, ih = R.h - 10;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const scale = (+$("sz").value) / 100;
+  const k = Math.max(iw / vw, ih / vh) * scale;
+  const dw = vw * k, dh = vh * k;
+  const px = R.x + 5 + (iw - dw) / 2 + (+$("ax").value) / 100 * iw;
+  const py = R.y + 5 + (ih - dh) / 2 + (+$("ay").value) / 100 * ih;
+  x.filter = anchorFilter();
+  x.translate(px + dw, 0); x.scale(-1, 1); x.translate(-px, 0);
+  x.drawImage(video, px, py, dw, dh);
+  x.restore(); x.filter = "none";
+
+  x.strokeStyle = SHINE; x.lineWidth = 3;
+  roundRect(x, R.x + 3, R.y + 3, R.w - 6, R.h - 6, 16); x.stroke();
 }
 
 /* --- graphics --- */
@@ -1374,7 +1471,9 @@ function drawFrame(ts) {
   const liveIdx = (S.liveItem === undefined) ? null : S.liveItem;
   drawHero(x, (liveIdx != null && S.items[liveIdx]) ? S.items[liveIdx] : null);
 
-  if (S.stream && video.videoWidth) {
+  if (S.stream && video.videoWidth && S.look === "window") {
+    drawWindow(x);
+  } else if (S.stream && video.videoWidth) {
     const scale = (+$("sz").value) / 100;
     const vw = video.videoWidth, vh = video.videoHeight;
     const axf = (+$("ax").value) / 100, ayf = (+$("ay").value) / 100;
@@ -1420,6 +1519,16 @@ function drawFrame(ts) {
       x.save(); x.filter = anchorFilter();
       x.translate(OUT_W, 0); x.scale(-1, 1);
       x.drawImage(video, OUT_W - dx - dw, dy, dw, dh); x.restore(); x.filter = "none";
+    }
+    /* Blur look: the real room, thrown out of focus, with you sharp on top.
+       Soft edges forgive matte error in a way a hard cut never will. */
+    if (S.look === "blur" && mask) {
+      x.save();
+      x.globalCompositeOperation = "destination-over";
+      x.filter = "blur(14px) brightness(0.82) saturate(0.85)";
+      x.translate(OUT_W, 0); x.scale(-1, 1);
+      x.drawImage(video, OUT_W - dx - dw - 30, dy - 20, dw + 60, dh + 40);
+      x.restore(); x.filter = "none";
     }
   }
 
@@ -1482,20 +1591,36 @@ function drawFrame(ts) {
 function drawCaption(x) {
   const said = S.words.filter(w => w.t != null && w.t >= 0);
   if (!said.length) return;
-  const win = said.slice(-9);
-  x.font = "700 34px Inter, sans-serif";
-  const parts = win.map(w => w.text);
-  const widths = parts.map(p => x.measureText(p + " ").width);
-  const total = widths.reduce((a, b) => a + b, 0);
-  const y = OUT_H - 62, padx = 22, boxH = 54;
-  let sx = (OUT_W - total) / 2;
-  x.fillStyle = "rgba(4,17,11,.82)";
-  roundRect(x, sx - padx, y - 38, total + padx * 2, boxH, 10); x.fill();
   const last = said[said.length - 1];
-  win.forEach((w, i) => {
-    x.fillStyle = (w === last) ? "#FFD75E" : "#FFFFFF";
-    x.fillText(w.text, sx, y);
-    sx += widths[i];
+  x.font = "700 34px Inter, sans-serif";
+  const maxW = OUT_W * 0.74;
+
+  /* lay the recent words into lines that fit, newest line last */
+  const win = said.slice(-14);
+  const lines = [[]];
+  let w = 0;
+  for (const word of win) {
+    const ww = x.measureText(word.text + " ").width;
+    if (w + ww > maxW && lines[lines.length - 1].length) { lines.push([]); w = 0; }
+    lines[lines.length - 1].push({ word, ww });
+    w += ww;
+  }
+  const show = lines.slice(-2);
+  const lineH = 46, padx = 24, padyT = 32, padyB = 14;
+  const boxW = Math.max(...show.map(L => L.reduce((a, i) => a + i.ww, 0)));
+  const boxH = show.length * lineH + padyB;
+  const top = OUT_H - 44 - boxH;
+  x.fillStyle = "rgba(4,17,11,.84)";
+  roundRect(x, (OUT_W - boxW) / 2 - padx, top - padyT + 14, boxW + padx * 2, boxH + 12, 10); x.fill();
+  show.forEach((L, li) => {
+    const lw = L.reduce((a, i) => a + i.ww, 0);
+    let sx = (OUT_W - lw) / 2;
+    const y = top + li * lineH + 26;
+    L.forEach(it => {
+      x.fillStyle = (it.word === last) ? "#FFD75E" : "#FFFFFF";
+      x.fillText(it.word.text, sx, y);
+      sx += it.ww;
+    });
   });
 }
 
@@ -2004,7 +2129,8 @@ const openLogo = new Image(); openLogo.src = OPENLOGO;
 const mustang  = new Image(); mustang.src  = MUSTANG;
 OPENSHOTS.forEach(sh => { sh.img = new Image(); sh.img.src = sh.src; });
 /* beat marks as a fraction of a 10-second open */
-const CUTS = [0, 1.55, 3.25, 4.95, 6.65, 8.20];
+const BAR = 1.702, BEAT = BAR / 4;          // 141 BPM — one bar per photo beat
+const CUTS = [0, 1.702, 3.404, 5.106, 6.808, 8.510];
 const HERD_VALUES = [
   ["H", "Health & well-being"],
   ["E", "Engagement"],
@@ -2322,10 +2448,13 @@ function impulse(ac, seconds, decay) {
 }
 function mixBus(ac, out) {
   const comp = ac.createDynamicsCompressor();
-  comp.threshold.value = -16; comp.knee.value = 22; comp.ratio.value = 3.2;
-  comp.attack.value = 0.006; comp.release.value = 0.22;
-  const master = ac.createGain(); master.gain.value = 1.05;
-  comp.connect(master).connect(out);
+  comp.threshold.value = -18; comp.knee.value = 18; comp.ratio.value = 4;
+  comp.attack.value = 0.005; comp.release.value = 0.20;
+  const limit = ac.createDynamicsCompressor();
+  limit.threshold.value = -3; limit.knee.value = 0; limit.ratio.value = 20;
+  limit.attack.value = 0.001; limit.release.value = 0.10;
+  const master = ac.createGain(); master.gain.value = 0.90;
+  comp.connect(limit).connect(master).connect(out);
 
   const dry = ac.createGain(); dry.gain.value = 1;
   const send = ac.createGain(); send.gain.value = 0.34;
@@ -2401,38 +2530,108 @@ async function sting(ac, out, t0, D) {
   }
   if (!$("openMusic").checked) return;
 
+  /* --------------------------------------------------------------
+     A news package, not a jingle: a pulse you can set your watch to,
+     a bass ostinato, brass stabs on the downbeats, a snare build,
+     and a full resolve under the wordmark. 141 BPM so every bar line
+     lands exactly on a picture cut.
+     -------------------------------------------------------------- */
   const k = D / 10, bus = mixBus(ac, out);
-  /* G minor 9 opening out to G major — dark to bright across the four values */
-  const G2 = 98.00, D3 = 146.83, G3 = 196.00, Bb3 = 233.08, B3 = 246.94,
-        C4 = 261.63, D4 = 293.66, E4 = 329.63, G4 = 392.00, A4 = 440.00, B4 = 493.88, D5 = 587.33;
+  const bar = BAR * k, beat = BEAT * k, T = n => t0 + n * beat;   // n = beats from zero
 
-  /* 0.0 — the room opens */
-  air(ac, bus, t0 + 0.05 * k, 1.30 * k, 0.16, 260, 2400);
-  hit(ac, bus, out, t0 + 0.12 * k, 0.72);
-  pad(ac, bus, [G2, D3, Bb3], t0 + 0.35 * k, 5.4 * k, 0.085);
-  /* a second bed overlaps the first so there is never a hole under the cuts */
-  pad(ac, bus, [G2, D3, C4], t0 + 4.30 * k, 4.2 * k, 0.070);
+  const G1 = 49.00, D2 = 73.42, G2 = 98.00, Bb2 = 116.54, C3 = 130.81, D3 = 146.83,
+        F3 = 174.61, G3 = 196.00, Bb3 = 233.08, B3 = 246.94, C4 = 261.63, D4 = 293.66,
+        E4 = 329.63, F4 = 349.23, G4 = 392.00, A4 = 440.00, B4 = 493.88, D5 = 587.33, G5 = 783.99;
 
-  /* 1.55 / 3.25 / 4.95 / 6.65 — one on each photo cut, the melody climbing */
-  const cuts = [1.55, 3.25, 4.95, 6.65];
+  /* --- kit ------------------------------------------------------ */
+  function timpani(t, f, gain) {
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = "sine";
+    o.frequency.setValueAtTime(f * 1.9, t);
+    o.frequency.exponentialRampToValueAtTime(f, t + 0.11);
+    g.gain.setValueAtTime(gain, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.85);
+    o.connect(g); g.connect(bus.dry); g.connect(bus.send);
+    o.start(t); o.stop(t + 0.9);
+    air(ac, bus, t, 0.10, gain * 0.10, 1800, 500);
+  }
+  function snare(t, dur, from, to) {           // a roll that tightens into the downbeat
+    const n = Math.max(2, Math.round(dur / 0.055));
+    for (let i = 0; i < n; i++) {
+      const f = i / (n - 1);
+      air(ac, bus, t + Math.pow(f, 1.35) * dur, 0.055, (from + (to - from) * f) * 0.5, 2400, 1400);
+    }
+  }
+  function cymbal(t, gain) { air(ac, bus, t, 1.9, gain, 7000, 2200); }
+  function brass(t, freqs, dur, gain) {        // sawtooth stack with the filter opening
+    freqs.forEach((f, i) => {
+      const o1 = ac.createOscillator(), o2 = ac.createOscillator(), g = ac.createGain();
+      const lp = ac.createBiquadFilter(); lp.type = "lowpass"; lp.Q.value = 0.9;
+      lp.frequency.setValueAtTime(500, t);
+      lp.frequency.exponentialRampToValueAtTime(3600, t + Math.min(0.18, dur * 0.4));
+      lp.frequency.exponentialRampToValueAtTime(900, t + dur);
+      o1.type = o2.type = "sawtooth"; o1.frequency.value = f; o2.frequency.value = f;
+      o1.detune.value = -9; o2.detune.value = 9;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(gain * (i ? 0.72 : 1), t + 0.035);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o1.connect(lp); o2.connect(lp); lp.connect(g);
+      g.connect(bus.dry); g.connect(bus.send);
+      o1.start(t); o2.start(t); o1.stop(t + dur + 0.05); o2.stop(t + dur + 0.05);
+    });
+  }
+  function bass(t, f, dur, gain) {
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = "triangle"; o.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(gain, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(bus.dry); o.start(t); o.stop(t + dur + 0.05);
+  }
+  function pulse(t, f, gain) {                 // short staccato note — the engine of the cue
+    const o = ac.createOscillator(), g = ac.createGain();
+    const lp = ac.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 2600;
+    o.type = "square"; o.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(gain, t + 0.008);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + beat * 0.62);
+    o.connect(lp).connect(g); g.connect(bus.dry); g.connect(bus.send);
+    o.start(t); o.stop(t + beat);
+  }
+
+  /* --- bar 0 : the room opens ----------------------------------- */
+  timpani(T(0), G1, 0.40);
+  air(ac, bus, T(0), bar * 1.02, 0.18, 200, 2100);
+  voice(ac, bus, "triangle", G1, T(0), bar * 1.05, 0.115);      // sustained, not a decaying pluck
+  pad(ac, bus, [G2, D3], T(0), bar * 1.05, 0.048);
+  snare(T(1.6), beat * 2.4, 0.02, 0.17);
+
+  /* --- bars 1-4 : one per photo, the pulse running underneath ---- */
+  const roots  = [G2, G2, C3, D3];
+  const stabs  = [[G3, Bb3, D4], [G3, C4, E4], [C4, E4, G4], [D4, F4, A4]];
   const melody = [D4, G4, A4, B4];
-  cuts.forEach((cut, i) => {
-    air(ac, bus, t0 + (cut - 0.34) * k, 0.46 * k, 0.10, 700, 4600);
-    hit(ac, bus, out, t0 + cut * k, 0.62 + i * 0.05);
-    voice(ac, bus, "triangle", melody[i], t0 + cut * k, 1.55 * k, 0.105, 0, melody[i] * 0.86);
-    voice(ac, bus, "sine", melody[i] * 2, t0 + cut * k, 0.95 * k, 0.038);
-  });
-  /* a counter-line under the third and fourth beats so it grows */
-  voice(ac, bus, "sawtooth", C4, t0 + 4.95 * k, 1.85 * k, 0.048, -6);
-  voice(ac, bus, "sawtooth", E4, t0 + 6.65 * k, 1.70 * k, 0.052, +6);
+  for (let b = 0; b < 4; b++) {
+    const t = T(4 + b * 4);
+    timpani(t, b < 2 ? G1 : D2, 0.30);
+    brass(t, stabs[b], beat * 2.6, 0.105);
+    voice(ac, bus, "triangle", melody[b], t, bar * 0.9, 0.075);
+    for (let e = 0; e < 8; e++) {              // eighth-note pulse
+      const te = t + e * beat / 2;
+      pulse(te, roots[b] * (e % 2 ? 2 : 1), e % 2 ? 0.048 : 0.080);
+      if (e % 2 === 0) bass(te, roots[b] / 2, beat * 0.55, 0.130);
+    }
+    if (b === 3) snare(t + beat * 2, beat * 2, 0.05, 0.22);   // the build into the resolve
+  }
 
-  /* 8.2 — resolve, major, with the tail ringing under the wordmark */
-  const tail = (D - 8.2 * k) + 1.2;
-  air(ac, bus, t0 + 7.95 * k, 0.9 * k, 0.12, 5200, 640);
-  hit(ac, bus, out, t0 + 8.20 * k, 0.95);
-  pad(ac, bus, [G2, D3, G3, B3, D4], t0 + 8.20 * k, tail, 0.105);
-  voice(ac, bus, "triangle", D5, t0 + 8.20 * k, tail * 0.8, 0.055);
-  voice(ac, bus, "sine", G4, t0 + 8.30 * k, tail * 0.9, 0.045);
+  /* --- bar 5 : resolve, held under the wordmark ------------------ */
+  const tR = T(20), tail = (D - (tR - t0)) + 1.4;
+  timpani(tR, G1, 0.44);
+  cymbal(tR, 0.16);
+  brass(tR, [G3, B3, D4, G4], Math.min(tail, 2.8), 0.115);
+  pad(ac, bus, [G2, D3, G3, B3, D4], tR, tail, 0.09);
+  voice(ac, bus, "triangle", D5, tR, tail * 0.75, 0.05);
+  voice(ac, bus, "sine", G5, tR + 0.12, tail * 0.6, 0.032);
+  bass(tR, G1, tail * 0.8, 0.13);
 }
 
 /* ---- run it: preview to the program monitor, or into the assembly ---- */
@@ -2644,6 +2843,11 @@ $("btnYT").onclick = async () => {
     plog("Video is up: https://youtu.be/" + id);
     google.script.run.withFailureHandler(e => plog("Couldn't log the show: " + e.message))
       .logPublished(id, $("ytTitle").value, chapterList(S.finalCues));
+    if (!$("ytCaps").checked) {
+      plog("Leaving captions to YouTube \u2014 it will transcribe the audio within a few minutes.");
+      toast("Published to YouTube.");
+      $("btnYT").disabled = false; return;
+    }
     plog("Attaching captions\u2026");
     if (HAS_GAS) {
       google.script.run.withSuccessHandler(() => plog("Captions attached."))
@@ -2728,6 +2932,7 @@ document.addEventListener("keydown", e => {
 
 /* boot */
 deskPaint();
+setLook(S.look);
 layoutPrompter();
 requestAnimationFrame(loop);
 renderRundown(); renderSegs(); setTransport("none");
