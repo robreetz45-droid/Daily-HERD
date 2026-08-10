@@ -439,7 +439,10 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
           <label class="chk"><input type="checkbox" id="steady" checked> Steady matte — blend across frames so the edge stops crawling</label>
           <label class="chk"><input type="checkbox" id="showMatte"> Show the matte instead of the picture</label>
           <label class="chk"><input type="checkbox" id="invert"> Invert mask (if the room stays and you disappear)</label>
-          <div class="field" style="margin-top:10px"><label>Contour smoothing <span class="n" id="smoV">3</span>
+          <div class="field" style="margin-top:10px"><label>Light wrap <span class="n" id="wrapV">45</span>%
+            <span class="n">— kills the halo</span></label>
+            <input type="range" id="wrap" min="0" max="100" value="45"></div>
+          <div class="field"><label>Contour smoothing <span class="n" id="smoV">3</span>
             <span class="n">— the fix for a wavy outline</span></label>
             <input type="range" id="smo" min="0" max="8" value="3"></div>
           </div>
@@ -626,7 +629,7 @@ const S = {
   segs: [], armed: null, cd: 0, cdT0: 0, paused: false, pausedAt: 0, pausedTotal: 0, discard: false,
   stream: null, audioStream: null,
   mode: "ai", look: "window", bgKey: "green", anchor: "right",
-  autoInv: false, invSum: 0, invN: 0, invDone: false, maskOK: false,
+  autoInv: false, invSum: 0, invN: 0, invDone: false, maskOK: false, lastSeg: 0, maskReady: false,
   segmenter: null, aiReady: false, plate: null,
   rolling: false, scrollY: 0, lastRAF: 0,
   recording: false, recStart: 0, recCues: [], tstate: "none",
@@ -777,7 +780,7 @@ function renderRundown() {
 function est(t) { const w = (t || "").trim().split(/\s+/).filter(Boolean).length; return fmtDur(w / 2.6); }
 
 function editStory(i) {
-  const it = S.items[i] || { slug:"", org:"", script:"", image:"" };
+  const it = S.items[i] || { id: "u" + Date.now().toString(36), slug:"", org:"", script:"", image:"" };
   const slug = prompt("Story headline:", it.slug); if (slug === null) return;
   const org = prompt("Club, team or activity:", it.org || ""); if (org === null) return;
   const sc = prompt("What the anchor reads (2–3 sentences):", it.script || ""); if (sc === null) return;
@@ -814,7 +817,7 @@ function pickImage(it) {
         cx.fillStyle = "#fff"; cx.fillRect(0, 0, c.width, c.height);
         cx.drawImage(im, 0, 0, c.width, c.height);
         it.image = c.toDataURL("image/jpeg", 0.86);
-        delete storyImgs[it.id];
+        it._img = null; it._imgFor = null;
         renderRundown();
         toast("Image loaded. It shows on screen while that story is read.");
       };
@@ -1021,6 +1024,8 @@ function sizeStage() {
 }
 $("res") && ($("res").onchange = () => { sizeStage(); startCamera(); });
 const maskC = document.createElement("canvas"), maskX = maskC.getContext("2d", { willReadFrequently: true });
+const edgeC = document.createElement("canvas"), edgeX = edgeC.getContext("2d");
+const wrapC = document.createElement("canvas"), wrapX = wrapC.getContext("2d");
 const personC = document.createElement("canvas"), personX = personC.getContext("2d");
 personC.width = 1920; personC.height = 1080;
 const smallC = document.createElement("canvas"), smallX = smallC.getContext("2d", { willReadFrequently: true });
@@ -1199,6 +1204,7 @@ function setLook(l) {
 }
 document.querySelectorAll("#segLook button").forEach(b => b.onclick = () => setLook(b.dataset.l));
 $("smo").oninput = () => $("smoV").textContent = $("smo").value;
+$("wrap").oninput = () => $("wrapV").textContent = $("wrap").value;
 document.querySelectorAll("#segBg button").forEach(b => b.onclick = () => {
   S.bgKey = b.dataset.b;
   document.querySelectorAll("#segBg button").forEach(x => x.setAttribute("aria-pressed", x === b));
@@ -1330,12 +1336,31 @@ function finishMask() {
     if (!Aprev || Aprev.length !== A.length) Aprev = Float32Array.from(A);
     else for (let i = 0; i < A.length; i++) A[i] = Aprev[i] = Aprev[i] * 0.45 + A[i] * 0.55;
   } else Aprev = null;
-  if (maskC.width !== Aw) { maskC.width = Aw; maskC.height = Ah; }
+  if (maskC.width !== Aw) { maskC.width = Aw; maskC.height = Ah; edgeC.width = Aw; edgeC.height = Ah; }
+
+  /* A band hugging the inside of the contour. Compositors call the next step a
+     light wrap: paint a blurred copy of the background into that band so the rim
+     of the subject picks up the colour behind them. It is the difference between
+     a cut-out pasted on top and something that looks lit by the same room. */
+  const wrapAmt = +$("wrap").value;
+  if (wrapAmt > 0) {
+    const full = Float32Array.from(A);
+    morph(-2);
+    const eimg = edgeX.createImageData(Aw, Ah), ed = eimg.data;
+    for (let i = 0, j = 0; i < A.length; i++, j += 4) {
+      ed[j] = ed[j+1] = ed[j+2] = 255;
+      ed[j+3] = Math.max(0, Math.min(1, full[i] - A[i])) * 255 | 0;
+    }
+    edgeX.putImageData(eimg, 0, 0);
+    A.set(full);
+  }
+
   const img = maskX.createImageData(Aw, Ah), d = img.data;
   for (let i = 0, j = 0; i < A.length; i++, j += 4) {
     d[j] = d[j+1] = d[j+2] = 255; d[j+3] = (A[i] * 255) | 0;
   }
   maskX.putImageData(img, 0, 0);
+  S.maskReady = true;
   return maskC;
 }
 
@@ -1343,9 +1368,11 @@ function buildMask(ts) {
   if (S.mode === "off") return null;
 
   if (S.mode === "ai" && S.aiReady && S.segmenter) {
+    if (ts - S.lastSeg < 48 && S.maskReady) return maskC;   // reuse the last matte
+    S.lastSeg = ts;
     let res;
-    try { res = S.segmenter.segmentForVideo(video, ts); } catch (e) { return null; }
-    if (!res) return null;
+    try { res = S.segmenter.segmentForVideo(video, ts); } catch (e) { return S.maskReady ? maskC : null; }
+    if (!res) return S.maskReady ? maskC : null;
     const cm = res.confidenceMasks && res.confidenceMasks.length ? res.confidenceMasks[0] : null;
     const km = res.categoryMask || null;
     const src = cm || km;
@@ -1417,9 +1444,10 @@ function roundRect(x, a, b, w, h, rad) {
 const HERO = { x: 58, y: 104, w: 580, h: 508 };
 function storyImg(item) {
   if (!item || !item.image) return null;
-  let im = storyImgs[item.id];
-  if (!im) { im = new Image(); im.src = item.image; storyImgs[item.id] = im; }
-  return (im.complete && im.naturalWidth) ? im : null;
+  if (!item._img || item._imgFor !== item.image) {
+    item._img = new Image(); item._img.src = item.image; item._imgFor = item.image;
+  }
+  return (item._img.complete && item._img.naturalWidth) ? item._img : null;
 }
 /* a picture loaded by hand, for when you are not working from the rundown */
 S.heroImg = null;
@@ -1513,6 +1541,29 @@ function drawFrame(ts) {
       personX.restore();
       personX.filter = "none";
       personX.globalCompositeOperation = "source-over";
+
+      const wrapAmt = +$("wrap").value;
+      if (wrapAmt > 0 && S.look !== "blur") {
+        if (wrapC.width !== personC.width) { wrapC.width = personC.width; wrapC.height = personC.height; }
+        wrapX.setTransform(1, 0, 0, 1, 0, 0);
+        wrapX.clearRect(0, 0, wrapC.width, wrapC.height);
+        stage(wrapX);
+        wrapX.filter = "blur(26px)";
+        if (bg && bg.complete) wrapX.drawImage(bg, 0, 0, OUT_W, OUT_H);
+        else { wrapX.fillStyle = "#062A1A"; wrapX.fillRect(0, 0, OUT_W, OUT_H); }
+        wrapX.filter = "none";
+        wrapX.globalCompositeOperation = "destination-in";
+        wrapX.save();
+        wrapX.translate(OUT_W, 0); wrapX.scale(-1, 1);
+        wrapX.drawImage(edgeC, OUT_W - dx - dw, dy, dw, dh);
+        wrapX.restore();
+        wrapX.globalCompositeOperation = "source-over";
+        personX.setTransform(1, 0, 0, 1, 0, 0);
+        personX.globalAlpha = wrapAmt / 100;
+        personX.drawImage(wrapC, 0, 0);
+        personX.globalAlpha = 1;
+      }
+
       personX.setTransform(1, 0, 0, 1, 0, 0);
       x.drawImage(personC, 0, 0, OUT_W, OUT_H);
     } else {
@@ -2020,6 +2071,18 @@ $("btnCancel").onclick = () => { cancelAssembly = true; plog("Stopping\u2026"); 
 $("btnRender").onclick = async () => {
   const btn = $("btnRender"); btn.disabled = true;
   cancelAssembly = false; $("btnCancel").disabled = false;
+  /* a single untrimmed segment with no open or close needs no second encode at
+     all — every re-encode costs quality, so skip it when we can */
+  if (S.segs.length === 1 && !$("openOn").checked && !$("closeOn").checked &&
+      S.segs[0].trimIn < 0.05 && S.segs[0].trimOut > S.segs[0].dur - 0.05) {
+    S.finalBlob = S.segs[0].blob; S.finalCues = S.segs[0].cues.slice();
+    $("pubLog").textContent = "One segment, nothing to join \u2014 using the original recording untouched.";
+    showReview(); pbar(1);
+    $("btnDl").disabled = $("btnDlCap").disabled = false;
+    $("btnYT").disabled = !(HAS_GAS || DESK.client);
+    btn.disabled = false; $("btnCancel").disabled = true;
+    return;
+  }
   $("pubLog").textContent = "Assembling " + S.segs.length + " segment(s) in real time. Leave this tab in front.";
   try {
     const { blob, cues } = await assemble();
@@ -2062,12 +2125,26 @@ async function assemble() {
   const done = new Promise(r => rec.onstop = r);
   rec.start(1000);
 
+  /* Load every take before the recorder opens. The old code loaded, seeked and
+     started each clip mid-render, and the recorder faithfully captured that
+     stall as a pause on a frozen frame between every segment. */
+  plog("Loading " + S.segs.length + " segment(s)…");
+  const prepped = [];
+  for (const tk of S.segs) {
+    const v = document.createElement("video");
+    v.src = tk.url; v.muted = false; v.playsInline = true; v.preload = "auto";
+    await once(v, "loadedmetadata", 10000, "metadata");
+    await once(v, "canplaythrough", 8000, "buffer");
+    prepped.push(v);
+  }
+
   const cues = []; let offset = 0;
   const oD = $("openOn").checked ? openDur() : 0;
   const cD = $("closeOn").checked ? 5 : 0;
   const total = S.segs.reduce((a, t) => a + (t.trimOut - t.trimIn), 0) + oD + cD;
 
   if (oD) {
+    if (rec.state === "paused") rec.resume();
     plog("Rolling the open (" + oD + "s)…");
     await fontsReady();
     await playSequence(x, drawOpen, oD, ac, dest, pr => pbar(pr * oD / total));
@@ -2077,15 +2154,16 @@ async function assemble() {
   for (let i = 0; i < S.segs.length; i++) {
     const tk = S.segs[i];
     plog("Segment " + (i + 1) + "/" + S.segs.length + " · " + tk.label);
-    const v = document.createElement("video");
-    v.src = tk.url; v.muted = false; v.playsInline = true; v.preload = "auto";
-    await once(v, "loadedmetadata", 10000, "metadata");
+    const v = prepped[i];
     const src = ac.createMediaElementSource(v); src.connect(dest);
-    if (tk.trimIn > 0.05) {                       // seeking to where you already are fires nothing
+    if (tk.trimIn > 0.05) {
       v.currentTime = tk.trimIn;
       await once(v, "seeked", 6000, "seek");
     }
+    /* hold the recorder over the join so no dead frames are captured */
+    if (rec.state === "recording") rec.pause();
     try { await v.play(); } catch (e) { plog("  (play refused: " + e.message + ")"); }
+    if (rec.state === "paused") rec.resume();
     tk.cues.forEach(q => { if (q.t >= tk.trimIn && q.t <= tk.trimOut) cues.push({ t: q.t - tk.trimIn + offset, text: q.text, itemIdx: q.itemIdx }); });
     await new Promise(res => {
       /* requestVideoFrameCallback fires once per decoded frame, so nothing is
@@ -2110,9 +2188,11 @@ async function assemble() {
       };
       useRVFC ? v.requestVideoFrameCallback(step) : requestAnimationFrame(step);
     });
+    if (rec.state === "recording") rec.pause();
     src.disconnect();
     offset += tk.trimOut - tk.trimIn;
   }
+  if (rec.state === "paused") rec.resume();
   if (cD) {
     plog("Rolling the close…");
     await playSequence(x, drawClose, cD, null, null, pr => pbar((offset + pr * cD) / total));
