@@ -286,6 +286,7 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
     <div>Segments<b id="mTakes">0</b></div>
     <div>Stories<b id="mStories">0</b></div>
     <div>Words<b id="mWords">0</b></div>
+    <div>FPS<b id="mFps">--</b></div>
     <div>Level<div class="lvl" id="lvl"></div></div>
   </div>
   <div class="brandmark">
@@ -460,6 +461,16 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
           <div class="field" style="margin-top:10px"><label>Image on screen right now</label>
             <div class="row"><button class="btn sm go" id="btnHeroImg" style="flex:1">Load an image</button>
               <button class="btn sm" id="btnHeroClr">Clear</button></div>
+            <div class="field" style="margin-top:10px"><label>How the picture sits</label>
+              <div class="seg" id="segFit">
+                <button data-f="contain" aria-pressed="true">Whole image</button>
+                <button data-f="cover" aria-pressed="false">Fill the box</button>
+              </div></div>
+            <div class="field"><label>Picture up / down <span class="n" id="iyV">0</span></label>
+              <input type="range" id="iy" min="-50" max="50" value="0"></div>
+            <div class="field"><label>Picture zoom <span class="n" id="izV">100</span>%</label>
+              <input type="range" id="iz" min="60" max="200" value="100"></div>
+            <p class="note">Whole image never crops — use it for posters and logos. Fill the box crops to the edges; the slider decides what survives. Each story remembers its own setting.</p>
             <p class="note" id="heroName">Nothing loaded — the big MV is showing. A story pulled from the rundown brings its own image and overrides this.</p></div>
           <label class="chk"><input type="checkbox" id="gBug" checked> Corner bug and date</label>
           <div class="field" style="margin-top:10px"><label>Anchor left / right <span class="n" id="axV">18</span>%</label>
@@ -504,6 +515,8 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
               <option value="1080" selected>1080p — 1920 &times; 1080</option>
               <option value="720">720p — 1280 &times; 720</option>
             </select></div>
+          <div class="field"><label>Codec <span class="n" id="codecNote"></span></label>
+            <select id="codec"></select></div>
           <div class="field"><label>Bitrate</label>
             <select id="qual">
               <option value="4000000">4 Mbps — light</option>
@@ -634,7 +647,7 @@ const S = {
   rolling: false, scrollY: 0, lastRAF: 0,
   recording: false, recStart: 0, recCues: [], tstate: "none",
   recorder: null, chunks: [], finalBlob: null, finalCues: [],
-  level: 0, recPeak: 0, ac: null, micSrc: null, micGain: null, audioOut: null, analyser: null, meterRunning: false
+  level: 0, recPeak: 0, fps: 0, adjTarget: undefined, warnedFps: false, ac: null, micSrc: null, micGain: null, audioOut: null, analyser: null, meterRunning: false
 };
 
 /* ---------- tiny helpers ---------- */
@@ -795,6 +808,24 @@ $("btnHeroImg").onclick = () => {
   f.onchange = () => f.files[0] && loadHero(f.files[0]);
   f.click();
 };
+/* framing lives on the story, so each picture keeps its own crop */
+function adjOf(item) {
+  const t = item || S;
+  if (!t._adj) t._adj = { fit: "contain", y: 0, z: 100 };
+  return t._adj;
+}
+function paintAdj() {
+  const a = adjOf(S.adjTarget);
+  document.querySelectorAll("#segFit button").forEach(b => b.setAttribute("aria-pressed", b.dataset.f === a.fit));
+  $("iy").value = a.y; $("iyV").textContent = a.y;
+  $("iz").value = a.z; $("izV").textContent = a.z;
+}
+document.querySelectorAll("#segFit button").forEach(b => b.onclick = () => {
+  adjOf(S.adjTarget).fit = b.dataset.f; paintAdj();
+});
+$("iy").oninput = () => { adjOf(S.adjTarget).y = +$("iy").value; $("iyV").textContent = $("iy").value; };
+$("iz").oninput = () => { adjOf(S.adjTarget).z = +$("iz").value; $("izV").textContent = $("iz").value; };
+
 $("btnHeroClr").onclick = () => {
   S.heroImg = null;
   $("heroName").textContent = "Nothing loaded \u2014 the big MV is showing.";
@@ -1115,6 +1146,16 @@ $("micGain").oninput = () => {
   if (S.micGain) S.micGain.gain.value = (+$("micGain").value) / 100;
 };
 $("audioProc").onchange = startCamera;
+(function fillCodecs() {
+  const sel = $("codec"), ok = supportedCodecs();
+  ok.forEach((c, i) => {
+    const o = el("option"); o.value = c[0];
+    o.textContent = c[1] + (i === 0 ? "  \u2014 fastest available" : "");
+    sel.appendChild(o);
+  });
+  if (!ok.length) { const o = el("option"); o.textContent = "no recorder support"; sel.appendChild(o); }
+  $("codecNote").textContent = ok.length ? ok.length + " available" : "";
+})();
 
 function meterLoop() {
   const bars = $("lvl").children;
@@ -1468,16 +1509,25 @@ function loadHero(file) {
 function drawHero(x, item) {
   const R = HERO;
   let im = $("gImg").checked ? storyImg(item) : null;
-  if (!im && S.heroImg && S.heroImg.naturalWidth) im = S.heroImg;
+  let owner = item;
+  if (!im && S.heroImg && S.heroImg.naturalWidth) { im = S.heroImg; owner = null; }
+  if (owner !== S.adjTarget) { S.adjTarget = owner; paintAdj(); }
   if (im) {
+    const adj = adjOf(owner);
     x.save(); x.shadowColor = "rgba(0,0,0,.55)"; x.shadowBlur = 38; x.shadowOffsetY = 14;
     roundRect(x, R.x, R.y, R.w, R.h, 16); x.fillStyle = "#0B1A13"; x.fill(); x.restore();
     x.save();
     roundRect(x, R.x + 5, R.y + 5, R.w - 10, R.h - 10, 12); x.clip();
     const iw = R.w - 10, ih = R.h - 10;
-    const k = Math.max(iw / im.naturalWidth, ih / im.naturalHeight);
+    if (adj.fit === "contain") {                     // white card behind, nothing cropped
+      x.fillStyle = "#FFFFFF"; x.fillRect(R.x + 5, R.y + 5, iw, ih);
+    }
+    const base = adj.fit === "cover"
+      ? Math.max(iw / im.naturalWidth, ih / im.naturalHeight)
+      : Math.min(iw / im.naturalWidth, ih / im.naturalHeight);
+    const k = base * adj.z / 100;
     const w = im.naturalWidth * k, h = im.naturalHeight * k;
-    x.drawImage(im, R.x + 5 + (iw - w) / 2, R.y + 5 + (ih - h) / 2, w, h);
+    x.drawImage(im, R.x + 5 + (iw - w) / 2, R.y + 5 + (ih - h) / 2 + adj.y / 100 * ih, w, h);
     x.restore();
     x.strokeStyle = SHINE; x.lineWidth = 3;
     roundRect(x, R.x + 3, R.y + 3, R.w - 6, R.h - 6, 14); x.stroke();
@@ -1677,7 +1727,7 @@ function drawCaption(x) {
 
 /* --- main loop --- */
 let prev = performance.now();
-let paintErr = 0;
+let paintErr = 0, fpsN = 0, fpsT0 = performance.now();
 function loop(t) {
   const dt = Math.min(0.05, (t - prev) / 1000); prev = t;
   try {
@@ -1686,6 +1736,17 @@ function loop(t) {
   if (S.recording) {
     $("tc").textContent = fmtTC(elapsed());
     if (!S.paused && S.level > S.recPeak) S.recPeak = S.level;
+  }
+  fpsN++;
+  if (t - fpsT0 > 1000) {
+    S.fps = Math.round(fpsN * 1000 / (t - fpsT0)); fpsN = 0; fpsT0 = t;
+    const e = $("mFps");
+    e.textContent = S.fps;
+    e.style.color = S.fps >= 24 ? "var(--shine)" : S.fps >= 15 ? "var(--amber)" : "var(--tally)";
+    if (S.recording && S.fps < 15 && !S.warnedFps) {
+      S.warnedFps = true;
+      toast("Only " + S.fps + " frames a second are being captured. Switch the codec to H.264 or drop to 720p.", true);
+    }
   }
   } catch (err) {
     /* one bad frame must never take the whole program monitor down with it */
@@ -1701,9 +1762,31 @@ function loop(t) {
    4. SEGMENT RECORDING
    One story, one segment. Countdown, pause, start over, stop.
    ============================================================ */
+/* VP9 is encoded in software and cannot keep up with a live 720p canvas on a
+   laptop CPU — it starves the capture down to a couple of frames a second.
+   H.264 is hardware-encoded on essentially every machine. Order matters. */
+const CODECS = [
+  ["video/mp4;codecs=avc1.42E01E,mp4a.40.2", "H.264 / MP4", "mp4"],
+  ["video/mp4;codecs=avc1,opus",             "H.264 / MP4", "mp4"],
+  ["video/mp4",                              "H.264 / MP4", "mp4"],
+  ["video/x-matroska;codecs=avc1,opus",      "H.264 / MKV", "mkv"],
+  ["video/webm;codecs=vp8,opus",             "VP8 / WebM",  "webm"],
+  ["video/webm;codecs=vp9,opus",             "VP9 / WebM (slow)", "webm"],
+  ["video/webm",                             "WebM",        "webm"]
+];
+function supportedCodecs() {
+  return CODECS.filter(c => { try { return MediaRecorder.isTypeSupported(c[0]); } catch (e) { return false; } });
+}
 function pickMime() {
-  const c = ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm", "video/mp4"];
-  return c.find(m => MediaRecorder.isTypeSupported(m)) || "";
+  const forced = $("codec") && $("codec").value;
+  if (forced) { const f = CODECS.find(c => c[0] === forced); if (f) return f[0]; }
+  const ok = supportedCodecs();
+  return ok.length ? ok[0][0] : "";
+}
+function fileExt() {
+  const m = pickMime();
+  const f = CODECS.find(c => c[0] === m);
+  return f ? f[2] : "webm";
 }
 function elapsed() {
   if (!S.recording) return 0;
@@ -1863,7 +1946,7 @@ function beginRec() {
   S.recorder.onstop = onRecStop;
   S.recorder.start(1000);
   if ($("ovlAuto").checked && !document.body.classList.contains("ovlOn")) ovlOpen(true);
-  S.recording = true; S.recStart = performance.now(); S.recPeak = 0;
+  S.recording = true; S.recStart = performance.now(); S.recPeak = 0; S.warnedFps = false;
   S.rolling = true; $("btnRoll").textContent = "Pause";
   setTransport("rec");
   renderRundown();
@@ -1954,7 +2037,7 @@ function renderSegs() {
       if (a === "dn" && i < S.segs.length - 1) S.segs.splice(i + 1, 0, S.segs.splice(i, 1)[0]);
       if (a === "rm") { if (!confirm("Delete the segment \u201c" + g.label + "\u201d? It won't go to editing.")) return; S.segs.splice(i, 1); }
       if (a === "rn") { const n = prompt("Segment name:", g.label); if (n) g.label = n; }
-      if (a === "dl") download(g.blob, g.label.replace(/\W+/g, "-") + ".webm");
+      if (a === "dl") download(g.blob, g.label.replace(/\W+/g, "-") + "." + fileExt());
       if (a === "re") {
         if (!confirm("Delete this segment and record it again?")) return;
         const k = g.key; S.segs.splice(i, 1); renderSegs(); armSlot(k); return startCountdown();
@@ -2867,7 +2950,8 @@ function chapterList(cues) {
   });
   return lines.join("\n");
 }
-$("btnDl").onclick = () => S.finalBlob && download(S.finalBlob, "daily-herd-" + new Date().toISOString().slice(0,10) + ".webm");
+$("btnDl").onclick = () => S.finalBlob && download(S.finalBlob,
+  "daily-herd-" + new Date().toISOString().slice(0,10) + "." + fileExt());
 $("btnDlCap").onclick = () => {
   const base = "daily-herd-" + new Date().toISOString().slice(0,10);
   download(new Blob([toSRT(S.finalCues)], { type: "text/plain" }), base + ".srt");
@@ -2891,7 +2975,7 @@ $("btnYT").onclick = async () => {
     }
     if (!auth.canPublish) {                       // not the channel owner — queue it in Drive
       plog("You're signed in as " + auth.email + ", which doesn't own the channel. Sending to the Drive queue instead.");
-      const name = "daily-herd-" + new Date().toISOString().slice(0,10) + ".webm";
+      const name = "daily-herd-" + new Date().toISOString().slice(0,10) + "." + fileExt();
       const id = await driveResumable(token, auth.folderId, name, S.finalBlob);
       plog("Saved to Drive: https://drive.google.com/file/d/" + id);
       toast("Queued in Drive for Principal Reetz.");
