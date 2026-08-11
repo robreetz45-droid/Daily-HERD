@@ -2861,28 +2861,89 @@ $("btnClosePrev").onclick = () => previewSequence(drawClose, 5);
    also means no second encode, so nothing is lost.
    ================================================================== */
 let FF = null, ffLoading = null;
-const FF_BASE = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd";
-const FF_LIB  = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js";
+/* Files served from your own repo first — same origin, nothing to be blocked,
+   works on a locked-down network. The CDN is only a fallback. */
+const FF_LOCAL = (function () {
+  try { return new URL("ff/", location.href).href; }
+  catch (e) { return "ff/"; }          // about:blank and file:// have no base
+})();
+const FF_CDN_LIB  = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/umd/";
+const FF_CDN_CORE = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd/";
+
+function loadScript(src) {
+  return new Promise((ok, no) => {
+    const t = setTimeout(() => no(new Error("timed out fetching " + src)), 45000);
+    const sc = document.createElement("script");
+    sc.src = src;
+    sc.onload = () => { clearTimeout(t); ok(); };
+    sc.onerror = () => { clearTimeout(t); no(new Error("could not load " + src)); };
+    document.head.appendChild(sc);
+  });
+}
+/* fetch with a byte counter, so a 32 MB download visibly moves */
+async function fetchProgress(url, label) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(label + " returned " + r.status);
+  const total = +r.headers.get("content-length") || 0;
+  if (!r.body || !total) return new Uint8Array(await r.arrayBuffer());
+  const reader = r.body.getReader(), chunks = [];
+  let got = 0, shown = -1;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    const pc = Math.floor(got / total * 100);
+    if (pc >= shown + 10) { shown = pc; plog("  " + label + " " + pc + "%"); pbar(got / total); }
+  }
+  const out = new Uint8Array(got); let at = 0;
+  for (const c of chunks) { out.set(c, at); at += c.length; }
+  return out;
+}
 
 async function ffLoad() {
   if (FF) return FF;
   if (ffLoading) return ffLoading;
   ffLoading = (async () => {
-    plog("Loading the video engine (about 30 MB, once per browser)\u2026");
-    const mod = await import(FF_LIB);
-    const ff = new mod.FFmpeg();
-    ff.on("log", ({ message }) => { if (/error|invalid|failed/i.test(message)) plog("  ffmpeg: " + message); });
+    let base = FF_LOCAL, coreBase = FF_LOCAL;
+    plog("Starting the video engine\u2026");
+    try {
+      await loadScript(base + "ffmpeg.js");
+    } catch (e) {
+      plog("  not found in your repo \u2014 trying the CDN.");
+      base = FF_CDN_LIB; coreBase = FF_CDN_CORE;
+      await loadScript(base + "ffmpeg.js");
+    }
+    const Ctor = window.FFmpegWASM && window.FFmpegWASM.FFmpeg;
+    if (!Ctor) throw new Error("engine script loaded but exported nothing");
+    const ff = new Ctor();
+    ff.on("log", ({ message }) => { if (/error|invalid|failed|no such/i.test(message)) plog("  ffmpeg: " + message); });
     ff.on("progress", ({ progress }) => { if (progress > 0 && progress <= 1) pbar(progress); });
-    const toBlobURL = async (url, type) => {
-      const r = await fetch(url);
-      if (!r.ok) throw new Error("could not fetch " + url.split("/").pop());
-      return URL.createObjectURL(new Blob([await r.arrayBuffer()], { type }));
-    };
-    await ff.load({
-      coreURL: await toBlobURL(FF_BASE + "/ffmpeg-core.js", "text/javascript"),
-      wasmURL: await toBlobURL(FF_BASE + "/ffmpeg-core.wasm", "application/wasm"),
-      classWorkerURL: await toBlobURL(FF_LIB.replace("index.js", "worker.js"), "text/javascript")
-    });
+
+    /* GitHub caps a web upload at 25 MB, so the 30 MB core ships gzipped at
+       under 10 MB and is expanded here. Downloads faster too. */
+    let wasm;
+    if (base === FF_LOCAL) {
+      plog("Fetching the engine core (under 10 MB compressed)\u2026");
+      const gz = await fetchProgress(coreBase + "ffmpeg-core.wasm.gz", "core");
+      plog("  expanding\u2026");
+      if (typeof DecompressionStream === "function") {
+        const ds = new DecompressionStream("gzip");
+        const stream = new Blob([gz]).stream().pipeThrough(ds);
+        wasm = new Uint8Array(await new Response(stream).arrayBuffer());
+      } else throw new Error("this browser cannot expand the compressed core \u2014 use Chrome or Edge");
+      if (!(wasm[0] === 0 && wasm[1] === 0x61 && wasm[2] === 0x73 && wasm[3] === 0x6d))
+        throw new Error("the core file did not expand correctly \u2014 re-upload ffmpeg-core.wasm.gz");
+      plog("  expanded to " + (wasm.length / 1048576).toFixed(0) + " MB.");
+    } else {
+      plog("Fetching the engine core from the CDN (about 32 MB)\u2026");
+      wasm = await fetchProgress(coreBase + "ffmpeg-core.wasm", "core");
+    }
+    const wasmURL = URL.createObjectURL(new Blob([wasm], { type: "application/wasm" }));
+
+    const load = ff.load({ coreURL: coreBase + "ffmpeg-core.js", wasmURL });
+    const guard = new Promise((_, no) => setTimeout(() =>
+      no(new Error("the engine did not finish starting within 90 seconds")), 90000));
+    await Promise.race([load, guard]);
     FF = ff; plog("Video engine ready.");
     return ff;
   })();
