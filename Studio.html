@@ -2167,13 +2167,20 @@ $("btnRender").onclick = async () => {
     btn.disabled = false; $("btnCancel").disabled = true;
     return;
   }
-  $("pubLog").textContent = "Assembling " + S.segs.length + " segment(s) in real time. Leave this tab in front.";
+  $("pubLog").textContent = "Joining " + S.segs.length + " segment(s).";
   try {
-    const { blob, cues } = await assemble();
+    let blob, cues;
+    try {
+      ({ blob, cues } = await assembleFF());
+    } catch (e) {
+      plog("Video engine unavailable (" + (e.message || e) + ").");
+      plog("Falling back to the real-time method \u2014 expect a pause at each join.");
+      ({ blob, cues } = await assemble());
+    }
     S.finalBlob = blob; S.finalCues = cues;
     showReview();
     $("btnDl").disabled = $("btnDlCap").disabled = false;
-    $("btnYT").disabled = !HAS_GAS;
+    $("btnYT").disabled = !(HAS_GAS || DESK.client);
     $("ytDesc").value += "\n\n" + chapterList(cues);
     plog("Done — " + (blob.size / 1048576).toFixed(1) + " MB.");
   } catch (e) { plog("Assembly failed: " + e.message); }
@@ -2839,6 +2846,131 @@ async function previewSequence(painter, D) {
 }
 $("btnOpenPrev").onclick = () => previewSequence(drawOpen, openDur());
 $("btnClosePrev").onclick = () => previewSequence(drawClose, 5);
+
+/* ==================================================================
+   JOINING THE SHOW WITH FFMPEG
+
+   Replaying each clip into a canvas and re-recording the result can
+   never be clean: every decode hiccup, every start-up delay and every
+   pause/resume seam lands in the output as a frozen frame. That is the
+   pause you keep seeing between segments.
+
+   FFmpeg compiled to WebAssembly joins the files by rewriting the
+   container instead. No playback, no encoder, no real-time pass — so a
+   gap between segments is not merely unlikely, it is impossible. It
+   also means no second encode, so nothing is lost.
+   ================================================================== */
+let FF = null, ffLoading = null;
+const FF_BASE = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/umd";
+const FF_LIB  = "https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm/index.js";
+
+async function ffLoad() {
+  if (FF) return FF;
+  if (ffLoading) return ffLoading;
+  ffLoading = (async () => {
+    plog("Loading the video engine (about 30 MB, once per browser)\u2026");
+    const mod = await import(FF_LIB);
+    const ff = new mod.FFmpeg();
+    ff.on("log", ({ message }) => { if (/error|invalid|failed/i.test(message)) plog("  ffmpeg: " + message); });
+    ff.on("progress", ({ progress }) => { if (progress > 0 && progress <= 1) pbar(progress); });
+    const toBlobURL = async (url, type) => {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error("could not fetch " + url.split("/").pop());
+      return URL.createObjectURL(new Blob([await r.arrayBuffer()], { type }));
+    };
+    await ff.load({
+      coreURL: await toBlobURL(FF_BASE + "/ffmpeg-core.js", "text/javascript"),
+      wasmURL: await toBlobURL(FF_BASE + "/ffmpeg-core.wasm", "application/wasm"),
+      classWorkerURL: await toBlobURL(FF_LIB.replace("index.js", "worker.js"), "text/javascript")
+    });
+    FF = ff; plog("Video engine ready.");
+    return ff;
+  })();
+  try { return await ffLoading; } catch (e) { ffLoading = null; throw e; }
+}
+
+async function blobToFF(ff, name, blob) {
+  await ff.writeFile(name, new Uint8Array(await blob.arrayBuffer()));
+}
+
+/* render the open or close once, on its own, so it becomes just another clip */
+async function renderSequence(painter, D, withSound) {
+  const c = document.createElement("canvas"); c.width = canW(); c.height = canH();
+  const x = c.getContext("2d"); x.imageSmoothingQuality = "high";
+  const ac = new (window.AudioContext || window.webkitAudioContext)();
+  const dest = ac.createMediaStreamDestination();
+  const cs = c.captureStream(30);
+  dest.stream.getAudioTracks().forEach(t => cs.addTrack(t));
+  const rec = new MediaRecorder(cs, { mimeType: pickMime(),
+    videoBitsPerSecond: +$("qual").value, audioBitsPerSecond: 192000 });
+  const parts = []; rec.ondataavailable = e => e.data.size && parts.push(e.data);
+  const done = new Promise(r => rec.onstop = r);
+  await fontsReady();
+  rec.start(1000);
+  await playSequence(x, painter, D, withSound ? ac : null, dest);
+  rec.stop(); await done; ac.close();
+  return new Blob(parts, { type: rec.mimeType });
+}
+
+async function assembleFF() {
+  const ff = await ffLoad();
+  const ext = fileExt();
+  const oD = $("openOn").checked ? openDur() : 0;
+  const cD = $("closeOn").checked ? 5 : 0;
+  const list = [], cues = [];
+  let offset = 0, n = 0;
+
+  if (oD) {
+    plog("Rendering the open once\u2026");
+    const b = await renderSequence(drawOpen, oD, true);
+    await blobToFF(ff, "p" + (++n) + "." + ext, b);
+    list.push("p" + n + "." + ext);
+    offset += oD;
+  }
+
+  for (let i = 0; i < S.segs.length; i++) {
+    const tk = S.segs[i];
+    const trimmed = tk.trimIn > 0.05 || tk.trimOut < tk.dur - 0.05;
+    const raw = "r" + i + "." + ext, cut = "c" + i + "." + ext;
+    plog("Segment " + (i + 1) + "/" + S.segs.length + " \u00b7 " + tk.label + (trimmed ? " (trimming)" : ""));
+    await blobToFF(ff, raw, tk.blob);
+    if (trimmed) {
+      /* a trim has to land between keyframes, so this one clip gets re-encoded.
+         Untrimmed clips are copied through untouched. */
+      await ff.exec(["-ss", String(tk.trimIn), "-to", String(tk.trimOut), "-i", raw,
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-c:a", "aac", "-y", cut]);
+      list.push(cut);
+    } else list.push(raw);
+    tk.cues.forEach(q => { if (q.t >= tk.trimIn && q.t <= tk.trimOut)
+      cues.push({ t: q.t - tk.trimIn + offset, text: q.text, itemIdx: q.itemIdx }); });
+    offset += tk.trimOut - tk.trimIn;
+  }
+
+  if (cD) {
+    plog("Rendering the close\u2026");
+    const b = await renderSequence(drawClose, cD, false);
+    await blobToFF(ff, "p" + (++n) + "." + ext, b);
+    list.push("p" + n + "." + ext);
+  }
+
+  await ff.writeFile("list.txt", new TextEncoder().encode(
+    list.map(f => "file '" + f + "'").join("\n") + "\n"));
+
+  const out = "show." + ext;
+  plog("Joining " + list.length + " clip(s) without re-encoding\u2026");
+  try {
+    await ff.exec(["-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy",
+      "-movflags", "+faststart", "-y", out]);
+  } catch (e) {
+    plog("Straight copy refused \u2014 re-encoding once to make the clips match.");
+    await ff.exec(["-f", "concat", "-safe", "0", "-i", "list.txt",
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+      "-c:a", "aac", "-movflags", "+faststart", "-y", out]);
+  }
+  const data = await ff.readFile(out);
+  await Promise.all(list.concat(["list.txt", out]).map(f => ff.deleteFile(f).catch(() => {})));
+  return { blob: new Blob([data.buffer], { type: ext === "mp4" ? "video/mp4" : "video/webm" }), cues };
+}
 
 /* --- review the finished show, and trim its head or tail --- */
 function showReview() {
