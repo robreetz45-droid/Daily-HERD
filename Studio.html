@@ -554,7 +554,8 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
       <p class="note" style="margin:2px 0 0">Leave that off and YouTube transcribes the audio itself, then you can correct any word in YouTube Studio. Attaching a file blocks that.</p>
       <div id="review" style="display:none;margin-top:14px">
         <label style="display:block;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--mist-dim);margin-bottom:5px">Review the assembled show</label>
-        <video id="revVid" controls style="width:100%;border-radius:10px;border:1px solid var(--line2);background:#000"></video>
+        <video id="revVid" controls playsinline style="width:100%;border-radius:10px;border:1px solid var(--line2);background:#000"></video>
+        <p class="note" style="margin-top:4px">If you open the player full screen, <kbd>Esc</kbd> comes back here.</p>
         <div class="trim" style="margin-top:8px"><span>IN</span><input type="range" id="revIn" min="0" max="100" step="0.05" value="0"></div>
         <div class="trim" style="margin-top:4px"><span>OUT</span><input type="range" id="revOut" min="0" max="100" step="0.05" value="100"></div>
         <div class="row" style="margin-top:8px">
@@ -2147,7 +2148,14 @@ $("btnAssemble").onclick = () => {
   $("btnYT").disabled = !(HAS_GAS || DESK.client);
   $("btnYT").textContent = HAS_GAS ? "3 \u00b7 Send to YouTube" : "3 \u00b7 Sign in & send to YouTube";
 };
-$("pubClose").onclick = () => $("pubModal").classList.remove("open");
+function closeAll() {
+  $("pubModal").classList.remove("open");
+  document.body.classList.remove("promptFull");
+  if (document.body.classList.contains("ovlOn")) ovlOpen(false);
+  if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+}
+$("pubClose").onclick = closeAll;
+$("pubModal").addEventListener("pointerdown", e => { if (e.target === $("pubModal")) closeAll(); });
 function plog(m) { const l = $("pubLog"); l.textContent += "\n" + m; l.scrollTop = l.scrollHeight; }
 function pbar(p) { $("pubBar").style.width = Math.round(p * 100) + "%"; }
 
@@ -2954,23 +2962,90 @@ async function blobToFF(ff, name, blob) {
   await ff.writeFile(name, new Uint8Array(await blob.arrayBuffer()));
 }
 
-/* render the open or close once, on its own, so it becomes just another clip */
-async function renderSequence(painter, D, withSound) {
+/* ------------------------------------------------------------------
+   The open, rendered offline.
+
+   Capturing it from a live canvas meant its smoothness depended on
+   whatever the laptop could manage that second — which is why it
+   stalled somewhere around the E beat. Instead the frames are drawn
+   one at a time with no clock at all, the music is rendered by an
+   OfflineAudioContext, and FFmpeg encodes both at an exact 30 fps.
+   The result is identical on every machine, every time.
+   ------------------------------------------------------------------ */
+const OPEN_FPS = 30;
+
+function audioBufferToWav(buf) {
+  const nCh = Math.min(2, buf.numberOfChannels), len = buf.length;
+  const bytes = 44 + len * nCh * 2;
+  const dv = new DataView(new ArrayBuffer(bytes));
+  const str = (off, sIn) => { for (let i = 0; i < sIn.length; i++) dv.setUint8(off + i, sIn.charCodeAt(i)); };
+  str(0, "RIFF"); dv.setUint32(4, bytes - 8, true); str(8, "WAVEfmt ");
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, nCh, true);
+  dv.setUint32(24, buf.sampleRate, true);
+  dv.setUint32(28, buf.sampleRate * nCh * 2, true);
+  dv.setUint16(32, nCh * 2, true); dv.setUint16(34, 16, true);
+  str(36, "data"); dv.setUint32(40, len * nCh * 2, true);
+  const chans = [];
+  for (let c = 0; c < nCh; c++) chans.push(buf.getChannelData(c));
+  let off = 44;
+  for (let i = 0; i < len; i++)
+    for (let c = 0; c < nCh; c++) {
+      let v = Math.max(-1, Math.min(1, chans[c][i]));
+      dv.setInt16(off, v < 0 ? v * 0x8000 : v * 0x7FFF, true); off += 2;
+    }
+  return new Uint8Array(dv.buffer);
+}
+
+async function renderSting(D) {
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (!OAC) return null;
+  try {
+    const sr = 48000;
+    const oac = new OAC(2, Math.ceil(sr * (D + 1.6)), sr);
+    await sting(oac, oac.destination, 0.02, D);
+    return audioBufferToWav(await oac.startRendering());
+  } catch (e) { plog("  (music could not be rendered: " + (e.message || e) + ")"); return null; }
+}
+
+function blobFromCanvas(c, q) {
+  return new Promise(r => c.toBlob(r, "image/jpeg", q));
+}
+
+/* draw every frame, write it to the engine, then encode at a fixed rate */
+async function renderSequenceFF(ff, painter, D, withSound, tag) {
   const c = document.createElement("canvas"); c.width = canW(); c.height = canH();
   const x = c.getContext("2d"); x.imageSmoothingQuality = "high";
-  const ac = new (window.AudioContext || window.webkitAudioContext)();
-  const dest = ac.createMediaStreamDestination();
-  const cs = c.captureStream(30);
-  dest.stream.getAudioTracks().forEach(t => cs.addTrack(t));
-  const rec = new MediaRecorder(cs, { mimeType: pickMime(),
-    videoBitsPerSecond: +$("qual").value, audioBitsPerSecond: 192000 });
-  const parts = []; rec.ondataavailable = e => e.data.size && parts.push(e.data);
-  const done = new Promise(r => rec.onstop = r);
   await fontsReady();
-  rec.start(1000);
-  await playSequence(x, painter, D, withSound ? ac : null, dest);
-  rec.stop(); await done; ac.close();
-  return new Blob(parts, { type: rec.mimeType });
+
+  const frames = Math.round(D * OPEN_FPS);
+  for (let i = 0; i < frames; i++) {
+    if (cancelAssembly) throw new Error("stopped");
+    x.setTransform(1, 0, 0, 1, 0, 0);
+    x.fillStyle = "#000"; x.fillRect(0, 0, c.width, c.height);
+    painter(x, i / OPEN_FPS, D);
+    const b = await blobFromCanvas(c, 0.88);
+    await ff.writeFile(tag + String(i).padStart(4, "0") + ".jpg",
+      new Uint8Array(await b.arrayBuffer()));
+    if (i % 15 === 0) { pbar(i / frames); await new Promise(r => setTimeout(r, 0)); }
+  }
+
+  const wav = withSound ? await renderSting(D) : null;
+  if (wav) await ff.writeFile(tag + ".wav", wav);
+
+  const out = tag + "." + fileExt();
+  const args = ["-framerate", String(OPEN_FPS), "-i", tag + "%04d.jpg"];
+  if (wav) args.push("-i", tag + ".wav");
+  args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p", "-r", String(OPEN_FPS));
+  if (wav) args.push("-c:a", "aac", "-b:a", "192k", "-shortest");
+  else args.push("-an");
+  args.push("-y", out);
+  await ff.exec(args);
+
+  for (let i = 0; i < frames; i++)
+    ff.deleteFile(tag + String(i).padStart(4, "0") + ".jpg").catch(() => {});
+  if (wav) ff.deleteFile(tag + ".wav").catch(() => {});
+  return out;
 }
 
 async function assembleFF() {
@@ -2982,10 +3057,8 @@ async function assembleFF() {
   let offset = 0, n = 0;
 
   if (oD) {
-    plog("Rendering the open once\u2026");
-    const b = await renderSequence(drawOpen, oD, true);
-    await blobToFF(ff, "p" + (++n) + "." + ext, b);
-    list.push("p" + n + "." + ext);
+    plog("Rendering the open frame by frame (" + Math.round(oD * OPEN_FPS) + " frames)\u2026");
+    list.push(await renderSequenceFF(ff, drawOpen, oD, true, "open"));
     offset += oD;
   }
 
@@ -3009,21 +3082,21 @@ async function assembleFF() {
 
   if (cD) {
     plog("Rendering the close\u2026");
-    const b = await renderSequence(drawClose, cD, false);
-    await blobToFF(ff, "p" + (++n) + "." + ext, b);
-    list.push("p" + n + "." + ext);
+    list.push(await renderSequenceFF(ff, drawClose, cD, false, "close"));
   }
 
   await ff.writeFile("list.txt", new TextEncoder().encode(
     list.map(f => "file '" + f + "'").join("\n") + "\n"));
 
   const out = "show." + ext;
-  plog("Joining " + list.length + " clip(s) without re-encoding\u2026");
+  plog("Joining " + list.length + " clip(s)\u2026");
   try {
     await ff.exec(["-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy",
       "-movflags", "+faststart", "-y", out]);
+    const probe = await ff.readFile(out);
+    if (!probe || probe.length < 10000) throw new Error("copy produced nothing usable");
   } catch (e) {
-    plog("Straight copy refused \u2014 re-encoding once to make the clips match.");
+    plog("Straight copy refused \u2014 re-encoding once so every clip matches.");
     await ff.exec(["-f", "concat", "-safe", "0", "-i", "list.txt",
       "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
       "-c:a", "aac", "-movflags", "+faststart", "-y", out]);
@@ -3275,16 +3348,13 @@ async function driveResumable(token, folderId, name, blob) {
    6. KEYS
    ============================================================ */
 document.addEventListener("keydown", e => {
+  if (e.key === "Escape") { closeAll(); return; }
   if (/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
   if (e.code === "Space") { e.preventDefault(); $("btnRoll").click(); }
   if (e.code === "ArrowUp") { e.preventDefault(); $("spd").value = +$("spd").value + 6; $("spd").oninput(); }
   if (e.code === "ArrowDown") { e.preventDefault(); $("spd").value = +$("spd").value - 6; $("spd").oninput(); }
   if (e.key === "f" || e.key === "F") $("btnFull").click();
-  if (e.key === "Escape") {
-    document.body.classList.remove("promptFull");
-    if (document.body.classList.contains("ovlOn")) ovlOpen(false);
-    $("pubModal").classList.remove("open");
-  }
+  if (e.key === "Escape") closeAll();
   if (e.key === "r" && e.metaKey === false && e.ctrlKey === false) { /* reserved */ }
 });
 
