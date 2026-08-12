@@ -497,6 +497,7 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
           <div class="field"><label>Desk token <span class="n">printed by setup()</span></label>
             <input type="text" id="deskToken" placeholder="paste the DESK TOKEN"></div>
           <div class="row"><button class="btn sm go" id="deskSave" style="flex:1">Save &amp; connect</button>
+            <button class="btn sm" id="deskTest">Test</button>
             <button class="btn sm" id="deskClear">Forget</button></div>
           <p class="note">Stored on this computer only. Do it once per machine.</p>
           <div class="field" style="margin-top:14px"><label>YouTube client ID <span class="n">optional — turns on one-click publishing</span></label>
@@ -741,24 +742,70 @@ $("deskSave").onclick = () => {
   deskPaint();
   $("btnPull").click();
 };
+$("deskTest").onclick = async () => {
+  const st = $("deskState");
+  st.innerHTML = "Knocking on the desk\u2026";
+  const t0 = Date.now();
+  try {
+    await deskFetch({ action: "ping" }, 3);
+    st.innerHTML = "<b style='color:var(--shine)'>The desk answered in " +
+      ((Date.now() - t0) / 1000).toFixed(1) + "s.</b> Pull today will work.";
+  } catch (e) {
+    st.innerHTML = "<b style='color:var(--tally)'>No answer: " + esc(e.message) + "</b><br>" +
+      "Open the address in a browser tab with <span style='font-family:var(--mono)'>?action=ping&amp;token=YOURTOKEN</span> on the end \u2014 " +
+      "if that shows a login page, the deployment is set to <i>Execute as: User accessing</i> and needs to be <i>Me</i>.";
+  }
+};
 $("deskClear").onclick = () => {
   ["deskUrl", "deskToken", "ytClient"].forEach(k => store.set(k, ""));
   deskPaint(); toast("Desk details cleared from this computer.");
 };
 
 /* JSONP, because a script tag is the one thing Apps Script will answer
-   cross-origin without a preflight it can't send headers for. */
+   cross-origin without a preflight it cannot respond to.
+
+   Apps Script cold-starts after a few minutes idle and can take 20-30 seconds
+   to answer the first request of the morning, which is why this used to work
+   only after a few reloads. So: a generous timeout, automatic retries, and a
+   cache-buster so a failed attempt is never remembered. */
 let jsonpN = 0;
+function deskGetOnce(params, timeoutMs) {
+  return new Promise((ok, no) => {
+    const cb = "herdCB" + (++jsonpN) + "_" + (Math.random() * 1e6 | 0);
+    let done = false;
+    const t = setTimeout(() => finish(() => no(new Error("no answer in " + Math.round(timeoutMs / 1000) + "s"))), timeoutMs);
+    function finish(then) {
+      if (done) return; done = true;
+      clearTimeout(t); delete window[cb];
+      if (sc.parentNode) sc.parentNode.removeChild(sc);
+      then();
+    }
+    window[cb] = r => finish(() => (r && r.ok) ? ok(r) : no(new Error(r && r.error || "the desk refused the request")));
+    const q = Object.assign({ token: DESK.token, cb: cb, _: Date.now() }, params);
+    const sc = document.createElement("script");
+    sc.src = DESK.url + "?" + Object.keys(q).map(k => k + "=" + encodeURIComponent(q[k])).join("&");
+    sc.onerror = () => finish(() => no(new Error("could not reach the desk address")));
+    document.body.appendChild(sc);
+  });
+}
+async function deskFetch(params, tries) {
+  tries = tries || 3;
+  let last;
+  for (let i = 0; i < tries; i++) {
+    try { return await deskGetOnce(params, i === 0 ? 25000 : 40000); }
+    catch (e) {
+      last = e;
+      if (i < tries - 1) {
+        notice("The desk is waking up \u2014 trying again (" + (i + 2) + " of " + tries + ")\u2026");
+        await new Promise(r => setTimeout(r, 1200 * (i + 1)));
+      }
+    }
+  }
+  throw last;
+}
+/* kept for callers that want the old shape */
 function deskGet(params, ok, fail) {
-  const cb = "herdCB" + (++jsonpN);
-  const t = setTimeout(() => { cleanup(); fail && fail(new Error("The desk didn't answer. Check the address, and that the deployment is set to Anyone.")); }, 15000);
-  function cleanup() { clearTimeout(t); delete window[cb]; sc.remove(); }
-  window[cb] = r => { cleanup(); r && r.ok ? ok(r.items) : fail && fail(new Error(r && r.error || "refused")); };
-  const q = Object.assign({ token: DESK.token, cb: cb }, params);
-  const sc = document.createElement("script");
-  sc.src = DESK.url + "?" + Object.keys(q).map(k => k + "=" + encodeURIComponent(q[k])).join("&");
-  sc.onerror = () => { cleanup(); fail && fail(new Error("Couldn't reach the desk address.")); };
-  document.body.appendChild(sc);
+  deskFetch(params).then(r => ok(r.items || r), fail);
 }
 
 /* ============================================================
@@ -887,10 +934,24 @@ function pickImage(it) {
   f.click();
 }
 
+async function fetchImages() {
+  const want = S.items.filter(it => it.imageId && !it.image);
+  if (!want.length) return;
+  for (let i = 0; i < want.length; i++) {
+    const it = want[i];
+    notice("Bringing in picture " + (i + 1) + " of " + want.length + "\u2026");
+    try {
+      const r = await deskFetch({ action: "image", id: it.imageId }, 2);
+      if (r.dataUrl) { it.image = r.dataUrl; it._img = null; renderRundown(); }
+    } catch (e) { /* a missing picture must never cost you the rundown */ }
+  }
+  notice("");
+}
+
 function loadItems(rows, note) {
   S.items = (rows || []).map(r => ({
     id: r.id, slug: r.slug, org: r.org, submitter: r.submitter,
-    script: r.script, image: r.imageDataUrl || "", on: true
+    script: r.script, image: r.imageDataUrl || "", imageId: r.imageId || "", on: true
   }));
   notice(S.items.length ? "" : (note || "Nothing approved for today yet."), "good");
   renderRundown(); buildScript(); renderSegs();
@@ -898,8 +959,10 @@ function loadItems(rows, note) {
 $("btnPull").onclick = () => {
   if (!HAS_GAS && DESK.ready) {
     notice("Pulling today's submissions\u2026");
-    return deskGet({ action: "rundown" },
-      rows => loadItems(rows),
+    return deskFetch({ action: "rundown" }).then(r => {
+      loadItems(r.items);
+      fetchImages();
+    }).catch(
       e => notice("The desk did not answer: " + e.message +
         "  \u2014 check that the address ends in /exec, that the deployment is set to Execute as: Me and Anyone, " +
         "and that you published a NEW VERSION after pasting the latest Code.gs."));
