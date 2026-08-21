@@ -2235,18 +2235,6 @@ $("btnCancel").onclick = () => { cancelAssembly = true; plog("Stopping\u2026"); 
 $("btnRender").onclick = async () => {
   const btn = $("btnRender"); btn.disabled = true;
   cancelAssembly = false; $("btnCancel").disabled = false;
-  /* a single untrimmed segment with no open or close needs no second encode at
-     all — every re-encode costs quality, so skip it when we can */
-  if (S.segs.length === 1 && !$("openOn").checked && !$("closeOn").checked &&
-      S.segs[0].trimIn < 0.05 && S.segs[0].trimOut > S.segs[0].dur - 0.05) {
-    S.finalBlob = S.segs[0].blob; S.finalCues = S.segs[0].cues.slice();
-    $("pubLog").textContent = "One segment, nothing to join \u2014 using the original recording untouched.";
-    showReview(); pbar(1);
-    $("btnDl").disabled = $("btnDlCap").disabled = false;
-    $("btnYT").disabled = !(HAS_GAS || DESK.client);
-    btn.disabled = false; $("btnCancel").disabled = true;
-    return;
-  }
   $("pubLog").textContent = "Joining " + S.segs.length + " segment(s).";
   try {
     let blob, cues;
@@ -3145,11 +3133,10 @@ async function renderSequenceFF(ff, painter, D, withSound, tag) {
   const out = tag + "." + fileExt();
   const args = ["-framerate", String(OPEN_FPS), "-i", tag + "%04d.jpg"];
   if (wav) args.push("-i", tag + ".wav");
+  else args.push("-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo");   // real silence, never a missing track
   args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-r", String(OPEN_FPS));
-  if (wav) args.push("-c:a", "aac", "-b:a", "192k", "-shortest");
-  else args.push("-an");
-  args.push("-y", out);
+            "-pix_fmt", "yuv420p", "-r", String(OPEN_FPS),
+            "-c:a", "aac", "-b:a", "192k", "-shortest", "-y", out);
   await ff.exec(args);
 
   for (let i = 0; i < frames; i++)
@@ -3168,7 +3155,7 @@ async function assembleFF() {
 
   if (oD) {
     plog("Rendering the open frame by frame (" + Math.round(oD * OPEN_FPS) + " frames)\u2026");
-    list.push(await renderSequenceFF(ff, drawOpen, oD, true, "open"));
+    list.push({ name: await renderSequenceFF(ff, drawOpen, oD, true, "open"), dur: oD });
     offset += oD;
   }
 
@@ -3183,8 +3170,8 @@ async function assembleFF() {
          Untrimmed clips are copied through untouched. */
       await ff.exec(["-ss", String(tk.trimIn), "-to", String(tk.trimOut), "-i", raw,
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", "-c:a", "aac", "-y", cut]);
-      list.push(cut);
-    } else list.push(raw);
+      list.push({ name: cut, dur: tk.trimOut - tk.trimIn });
+    } else list.push({ name: raw, dur: tk.dur });
     tk.cues.forEach(q => { if (q.t >= tk.trimIn && q.t <= tk.trimOut)
       cues.push({ t: q.t - tk.trimIn + offset, text: q.text, itemIdx: q.itemIdx }); });
     offset += tk.trimOut - tk.trimIn;
@@ -3192,28 +3179,51 @@ async function assembleFF() {
 
   if (cD) {
     plog("Rendering the close\u2026");
-    list.push(await renderSequenceFF(ff, drawClose, cD, false, "close"));
+    list.push({ name: await renderSequenceFF(ff, drawClose, cD, false, "close"), dur: cD });
   }
 
-  await ff.writeFile("list.txt", new TextEncoder().encode(
-    list.map(f => "file '" + f + "'").join("\n") + "\n"));
+  /* ------------------------------------------------------------------
+     Joining.
 
-  const out = "show." + ext;
-  plog("Joining " + list.length + " clip(s)\u2026");
-  try {
-    await ff.exec(["-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy",
-      "-movflags", "+faststart", "-y", out]);
-    const probe = await ff.readFile(out);
-    if (!probe || probe.length < 10000) throw new Error("copy produced nothing usable");
-  } catch (e) {
-    plog("Straight copy refused \u2014 re-encoding once so every clip matches.");
-    await ff.exec(["-f", "concat", "-safe", "0", "-i", "list.txt",
-      "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-      "-c:a", "aac", "-movflags", "+faststart", "-y", out]);
-  }
+     A straight container copy is only legal when every clip already has
+     the same size, frame rate, pixel format and time base. The open is
+     rendered at a fixed 30fps; MediaRecorder takes are variable-rate and
+     carry a different time base. Copying them together produced a file
+     whose header claimed two minutes for twenty seconds of video, with a
+     48-second hole in the middle — which is exactly why it stalled, then
+     stopped, then restarted from the beginning when you pressed play.
+
+     So every clip is normalised through one filter graph instead. It
+     costs one encode and guarantees continuous timestamps.
+     ------------------------------------------------------------------ */
+  const W = canW(), H = canH(), FPS = OPEN_FPS;
+  const vChain = "scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease," +
+                 "pad=" + W + ":" + H + ":-1:-1:color=black,setsar=1,fps=" + FPS;
+  const aChain = "aresample=48000:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo";
+
+  const args = [];
+  list.forEach(c => args.push("-i", c.name));
+
+  let fc = "", legs = "";
+  list.forEach((c, i) => {
+    fc += "[" + i + ":v]" + vChain + "[v" + i + "];";
+    fc += "[" + i + ":a]" + aChain + "[a" + i + "];";
+    legs += "[v" + i + "][a" + i + "]";
+  });
+  fc += legs + "concat=n=" + list.length + ":v=1:a=1[v][a]";
+
+  const out = "show.mp4";
+  plog("Joining " + list.length + " clip(s) and normalising every one to " +
+       W + "\u00d7" + H + " at " + FPS + "fps\u2026");
+  args.push("-filter_complex", fc, "-map", "[v]", "-map", "[a]",
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+    "-r", String(FPS), "-c:a", "aac", "-b:a", "192k",
+    "-movflags", "+faststart", "-y", out);
+  await ff.exec(args);
+
   const data = await ff.readFile(out);
-  await Promise.all(list.concat(["list.txt", out]).map(f => ff.deleteFile(f).catch(() => {})));
-  return { blob: new Blob([data.buffer], { type: ext === "mp4" ? "video/mp4" : "video/webm" }), cues };
+  await Promise.all(list.map(c => c.name).concat([out]).map(f => ff.deleteFile(f).catch(() => {})));
+  return { blob: new Blob([data.buffer], { type: "video/mp4" }), cues };
 }
 
 /* --- review the finished show, and trim its head or tail --- */
