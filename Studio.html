@@ -680,7 +680,7 @@ const S = {
   segs: [], armed: null, cd: 0, cdT0: 0, paused: false, pausedAt: 0, pausedTotal: 0, discard: false,
   stream: null, audioStream: null,
   mode: "off", look: "cutout", bgKey: "green", anchor: "right",
-  autoInv: false, invSum: 0, invN: 0, invDone: false, maskOK: false, heldItem: null, lastSeg: 0, maskReady: false,
+  autoInv: false, invSum: 0, invN: 0, invDone: false, maskOK: false, shownKey: "open", lastSeg: 0, maskReady: false,
   segmenter: null, aiReady: false, plate: null,
   rolling: false, scrollY: 0, lastRAF: 0,
   recording: false, recStart: 0, recCues: [], tstate: "none",
@@ -911,7 +911,7 @@ $("iy").oninput = () => { adjOf(S.adjTarget).y = +$("iy").value; $("iyV").textCo
 $("iz").oninput = () => { adjOf(S.adjTarget).z = +$("iz").value; $("izV").textContent = $("iz").value; };
 
 $("btnHeroClr").onclick = () => {
-  S.heroImg = null; S.heldItem = null;
+  S.heroImg = null;
   $("heroName").textContent = "Nothing loaded \u2014 the big MV is showing.";
 };
 
@@ -951,7 +951,7 @@ async function fetchImages() {
     notice("Bringing in picture " + (i + 1) + " of " + want.length + "\u2026");
     try {
       const r = await deskFetch({ action: "image", id: it.imageId }, 2);
-      if (r.dataUrl) { it.image = r.dataUrl; it._img = null; renderRundown(); }
+      if (r.dataUrl) { it.image = r.dataUrl; it._img = null; primeImg(it); renderRundown(); }
     } catch (e) { /* a missing picture must never cost you the rundown */ }
   }
   notice("");
@@ -962,6 +962,7 @@ function loadItems(rows, note) {
     id: r.id, slug: r.slug, org: r.org, submitter: r.submitter,
     script: r.script, image: r.imageDataUrl || "", imageId: r.imageId || "", on: true
   }));
+  S.items.forEach(primeImg);
   notice(S.items.length ? "" : (note || "Nothing approved for today yet."), "good");
   renderRundown(); buildScript(); renderSegs();
 }
@@ -1140,7 +1141,6 @@ function promptTick(dt) {
     document.querySelectorAll("#promptInner w.now").forEach(n => n.classList.remove("now"));
     cur.el.classList.add("now"); cur.el.classList.remove("said");
     S.liveItem = cur.itemIdx;
-    if (cur.itemIdx != null) S.heldItem = cur.itemIdx;
   }
 }
 
@@ -1591,10 +1591,17 @@ function roundRect(x, a, b, w, h, rad) {
 const HERO = { x: 58, y: 104, w: 580, h: 508 };
 function storyImg(item) {
   if (!item || !item.image) return null;
-  if (!item._img || item._imgFor !== item.image) {
-    item._img = new Image(); item._img.src = item.image; item._imgFor = item.image;
-  }
+  primeImg(item);
   return (item._img.complete && item._img.naturalWidth) ? item._img : null;
+}
+function primeImg(item) {
+  if (!item || !item.image) return;
+  if (!item._img || item._imgFor !== item.image) {
+    item._img = new Image();
+    item._imgFor = item.image;
+    item._img.onload = () => renderSegs();      // refresh the "has a picture" tick
+    item._img.src = item.image;
+  }
 }
 /* a picture loaded by hand, for when you are not working from the rundown */
 S.heroImg = null;
@@ -1637,13 +1644,44 @@ function drawHero(x, item) {
     x.restore();
     x.strokeStyle = SHINE; x.lineWidth = 3;
     roundRect(x, R.x + 3, R.y + 3, R.w - 6, R.h - 6, 14); x.stroke();
-  } else if (openLogo.complete && openLogo.naturalWidth) {
-    const w = Math.min(R.w * 0.96, 548);
+  } else {
+    drawTitleCard(x, R);
+  }
+}
+
+/* What stands in the picture slot while the anchor is on the open or the close:
+   the mark, the show name, and Home of the Mustangs. Never a story's photo. */
+function drawTitleCard(x, R) {
+  const cx = R.x + R.w / 2;
+  const bottom = R.y + R.h - 40;          // stay clear of the lower third
+  let y = R.y + 24;
+  if (openLogo.complete && openLogo.naturalWidth) {
+    const w = Math.min(R.w * 0.62, 330);
     const h = w * openLogo.naturalHeight / openLogo.naturalWidth;
     x.save(); x.shadowColor = "rgba(0,0,0,.35)"; x.shadowBlur = 26; x.shadowOffsetY = 10;
-    x.drawImage(openLogo, R.x + (R.w - w) / 2, R.y + (R.h - h) / 2, w, h);
+    x.drawImage(openLogo, cx - w / 2, y, w, h);
     x.restore();
-  }
+    y += h + 54;
+  } else y = R.y + R.h * 0.40;
+  if (y + 150 > bottom) y = bottom - 150;
+
+  x.save();
+  x.textAlign = "center";
+  setType(x, 600, 24, "'Barlow Condensed','Arial Narrow',sans-serif", 11);
+  x.fillStyle = SHINE;
+  x.fillText("THE DAILY", cx, y);
+  setType(x, 700, 88, "'Barlow Condensed','Arial Narrow',sans-serif", 3);
+  x.fillStyle = "#FFFFFF";
+  x.fillText("HERD", cx, y + 78);
+  const rw = x.measureText("HERD").width;
+  x.fillStyle = SHINE;
+  x.fillRect(cx - rw / 2, y + 94, rw, 5);
+  setType(x, 600, 23, "Inter,system-ui,sans-serif", 2);
+  x.fillStyle = "rgba(255,255,255,.92)";
+  x.fillText("Home of the Mustangs", cx, y + 132);
+  x.textAlign = "left";
+  x.restore();
+  try { x.letterSpacing = "0px"; } catch (e) {}
 }
 
 function drawFrame(ts) {
@@ -1654,8 +1692,11 @@ function drawFrame(ts) {
   else { x.fillStyle = "#062A1A"; x.fillRect(0, 0, OUT_W, OUT_H); }
   /* the last story we actually saw, so its picture stays up through the anchor
      lines that follow it rather than blinking out */
-  let liveIdx = (S.liveItem == null) ? S.heldItem : S.liveItem;
-  if (liveIdx === undefined) liveIdx = null;
+  /* The segment picker decides what is on screen. It does not change while you
+     record, or when you stop, or when the prompter rolls past an anchor line —
+     only when you choose the next segment. Open and close show the title card;
+     a story shows that story's picture. */
+  const liveIdx = itemIdxFor(S.shownKey);
   drawHero(x, (liveIdx != null && S.items[liveIdx]) ? S.items[liveIdx] : null);
 
   if (S.stream && video.videoWidth && S.look === "window") {
@@ -1906,7 +1947,11 @@ function slotOrg(key) {
   const f = slotList().find(o => String(o.key) === String(key));
   return f ? f.org : "";
 }
-function itemIdxFor(key) { return typeof key === "number" ? key : null; }
+function itemIdxFor(key) {
+  if (key === "open" || key === "close" || key === "extra" || key == null) return null;
+  const n = typeof key === "number" ? key : parseInt(key, 10);
+  return (isNaN(n) || !S.items[n]) ? null : n;
+}
 function nextKey() {
   const used = S.segs.map(g => String(g.key));
   const free = slotList().find(o => used.indexOf(String(o.key)) === -1);
@@ -1946,9 +1991,9 @@ function jumpTo(key) {
 /* --- arm a slot --- */
 function armSlot(key) {
   S.armed = { key: key === undefined || key === null ? nextKey() : key };
+  S.shownKey = S.armed.key;                 // this is what the picture follows
   jumpTo(S.armed.key);
   S.liveItem = itemIdxFor(S.armed.key);
-  if (S.liveItem != null) S.heldItem = S.liveItem;
   S.rolling = false; $("btnRoll").textContent = "Roll";
   renderSegs(); renderRundown(); setTransport("idle");
 }
@@ -2089,6 +2134,16 @@ $("btnStop").onclick = () => {
 /* ============================================================
    4b. THE SEGMENT STACK
    ============================================================ */
+function armedPicture() {
+  const idx = itemIdxFor(S.armed && S.armed.key);
+  if (idx == null) return "On screen: the <b>Daily HERD</b> title card.";
+  const it = S.items[idx];
+  if (!it.image) return "On screen: the title card \u2014 <b>this story has no picture</b>.";
+  return storyImg(it)
+    ? "On screen: <b style=\"color:var(--shine)\">" + esc(it.slug) + "</b>\u2019s picture."
+    : "Picture still loading\u2026";
+}
+
 function renderSegs() {
   const box = $("segList"); if (!box) return;
   box.innerHTML = "";
@@ -2148,6 +2203,7 @@ function renderSegs() {
       '<div class="armhead"><span class="sc-n">' + String(S.segs.length + 1).padStart(2, "0") + ' · NEXT</span>' +
       '<span class="st">' + (st === "rec" ? "Recording" : st === "paused" ? "Paused" : st === "count" ? "Rolling in" : "Ready") + '</span></div>' +
       '<select id="armPick"' + (st === "idle" || st === "none" ? "" : " disabled") + '>' + opts + '</select>' +
+      '<div class="hint" style="margin-top:6px">' + armedPicture() + '</div>' +
       '<button class="armrec" id="armRec"' + (st === "idle" ? "" : " disabled") + '>● Record — 3 · 2 · 1</button>' +
       '<div class="hint" style="margin-top:7px">The prompter is parked at the top of this segment. Pause any time; the timing keeps up.</div>';
   }
