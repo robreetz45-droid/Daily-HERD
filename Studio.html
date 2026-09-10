@@ -409,8 +409,8 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
         <div class="pad">
           <div class="field"><label>Look</label>
             <div class="seg" id="segLook">
-              <button data-l="window" aria-pressed="false">Window</button>
-              <button data-l="cutout" aria-pressed="true">Full frame</button>
+              <button data-l="window" aria-pressed="true">Window</button>
+              <button data-l="cutout" aria-pressed="false">Full frame</button>
               <button data-l="blur" aria-pressed="false">Blur</button>
             </div>
             <p class="note"><b>Window</b> puts the camera in a framed panel on the brand background — no matte, so no wavy edge, ever. <b>Cutout</b> removes the room. <b>Blur</b> keeps your room but throws it out of focus, which hides matte errors far better than a hard cut.</p>
@@ -681,8 +681,9 @@ const S = {
   words: [],            // {el, itemIdx, text, t}
   segs: [], armed: null, cd: 0, cdT0: 0, paused: false, pausedAt: 0, pausedTotal: 0, discard: false,
   stream: null, audioStream: null,
-  mode: "off", look: "cutout", bgKey: "green", anchor: "right",
-  autoInv: false, invSum: 0, invN: 0, invDone: false, maskOK: false, shownKey: "open", lastSeg: 0, maskReady: false,
+  mode: "off", look: "window", bgKey: "green", anchor: "right",
+  autoInv: false, invSum: 0, invN: 0, invDone: false, maskOK: false, shownKey: "open",
+  measured: false, shellH: 360, maxScroll: null, nowWord: null, lastSeg: 0, maskReady: false,
   segmenter: null, aiReady: false, plate: null,
   rolling: false, scrollY: 0, lastRAF: 0,
   recording: false, recStart: 0, recCues: [], tstate: "none",
@@ -851,6 +852,7 @@ function renderRundown() {
       '<div class="tools">' +
         '<button data-a="load" style="border-color:var(--turf-lite);color:var(--shine)">\u25b8 To prompter</button>' +
         '<button data-a="img">' + (it.image ? "Change image" : "Add image") + '</button>' +
+        '<button data-a="strap">Banner</button>' +
         '<button data-a="tog">' + (it.on !== false ? "In show" : "Held") + '</button>' +
         '<button data-a="up">↑</button><button data-a="dn">↓</button>' +
         '<button data-a="edit">Edit</button><button data-a="del">Drop</button>' +
@@ -864,6 +866,7 @@ function renderRundown() {
       if (a === "del") S.items.splice(i, 1);
       if (a === "edit") editStory(i);
       if (a === "img") return pickImage(it);
+      if (a === "strap") return editStrap(it);
       if (a === "load") {
         if (!S.words.length) buildScript();
         armSlot(i);
@@ -929,6 +932,18 @@ $("btnHeroClr").onclick = () => {
   S.heroImg = null;
   $("heroName").textContent = "Nothing loaded \u2014 the big MV is showing.";
 };
+
+function editStrap(it) {
+  const cur = strapFor(it);
+  const title = prompt("Banner \u2014 top line (the team, club or headline):", cur.title);
+  if (title === null) return;
+  const sub = prompt("Banner \u2014 second line (drawn from the script; edit freely):", cur.sub);
+  if (sub === null) return;
+  it.strapTitle = title.trim();
+  it.strapSub = sub.trim();
+  renderRundown();
+  toast("Banner updated for \u201c" + (it.slug || title) + "\u201d.");
+}
 
 /* drop any picture in from this computer — resized so it doesn't bloat the page */
 function pickImage(it) {
@@ -1088,6 +1103,8 @@ function loadPrompter() {
       inner.appendChild(p);
     });
   });
+  S.measured = false; S.maxScroll = null; S.nowWord = null;
+  requestAnimationFrame(() => { measureWords(); if (S.armed) jumpTo(S.armed.key); });
   $("mWords").textContent = S.words.length;
   $("mShow").textContent = fmtDur(S.words.length / 2.6);
   rewind();
@@ -1098,14 +1115,13 @@ function loadPrompter() {
 function nudge(dy) {
   S.scrollY = Math.max(0, S.scrollY + dy);
   $("promptInner").style.transform = "translateY(" + (-S.scrollY) + "px)";
-  const shell = $("prompter").getBoundingClientRect();
-  const lineY = shell.top + shell.height * (+$("rl").value / 100);
+  if (!S.measured) return;
+  const lineY = S.scrollY + S.shellH * (+$("rl").value / 100);
   let undone = 0;
   for (let i = S.words.length - 1; i >= 0; i--) {
     const w = S.words[i];
     if (w.t == null || w.t < 0) continue;
-    const r = w.el.getBoundingClientRect();
-    if (r.bottom > lineY) { w.t = null; w.el.className = ""; undone++; } else break;
+    if (w.bot > lineY) { w.t = null; w.el.className = ""; S.nowWord = null; undone++; } else break;
   }
   if (undone && S.recording) S.recCues.splice(Math.max(0, S.recCues.length - undone));
 }
@@ -1126,7 +1142,7 @@ function nudge(dy) {
 })();
 
 function rewind() {
-  S.scrollY = 0; S.rolling = false;
+  S.scrollY = 0; S.rolling = false; S.nowWord = null;
   S.words.forEach(w => { w.t = null; w.el.className = ""; });
   $("promptInner").style.transform = "translateY(0px)";
 }
@@ -1150,6 +1166,8 @@ function layoutPrompter() {
   $("readline").style.top = pos + "%";
   const shellH = $("prompter").getBoundingClientRect().height || 360;
   inner.style.paddingTop = Math.round(shellH * pos / 100 + 28) + "px";
+  S.maxScroll = null;
+  requestAnimationFrame(measureWords);
 }
 ["fsz","rl","mirror"].forEach(id => $(id).oninput = () => { $("fszV").textContent = $("fsz").value; layoutPrompter(); });
 window.addEventListener("resize", layoutPrompter);
@@ -1158,32 +1176,43 @@ $("spd").oninput = () => {
   if ($("ovlSpd")) $("ovlSpd").textContent = $("spd").value;
 };
 
+/* measure once, after any layout change, and never during the roll */
+function measureWords() {
+  const inner = $("promptInner");
+  if (!inner || !S.words.length) return;
+  for (const w of S.words) {
+    const el = w.el;
+    w.bot = el.offsetTop + el.offsetHeight;      // read together, one layout pass
+  }
+  S.shellH = $("prompter").getBoundingClientRect().height || 360;
+  S.measured = true;
+}
+
 function promptTick(dt) {
   if (S.rolling) {
     S.scrollY += (+$("spd").value) * dt;
     const inner = $("promptInner");
-    const max = inner.scrollHeight + 100;
-    if (S.scrollY > max) { S.scrollY = max; S.rolling = false; $("btnRoll").textContent = "Roll"; }
+    if (S.maxScroll == null) S.maxScroll = inner.scrollHeight + 100;
+    if (S.scrollY > S.maxScroll) { S.scrollY = S.maxScroll; S.rolling = false; $("btnRoll").textContent = "Roll"; }
     inner.style.transform = "translateY(" + (-S.scrollY) + "px)";
   }
-  // time words as they cross the read line
-  const shell = $("prompter").getBoundingClientRect();
-  const lineY = shell.top + shell.height * (+$("rl").value / 100);
+  if (!S.measured) return;
+
+  /* a word has been read once its bottom edge has passed the read line */
+  const lineY = S.scrollY + S.shellH * (+$("rl").value / 100);
   let cur = null;
   for (const w of S.words) {
-    if (w.t == null) {
-      const r = w.el.getBoundingClientRect();
-      if (r.bottom <= lineY && r.width) {
-        w.t = S.recording ? elapsed() : 0;
-        w.el.className = "said";
-        if (S.recording) S.recCues.push({ t: w.t, text: w.text, itemIdx: w.itemIdx });
-      }
+    if (w.t == null && w.bot <= lineY) {
+      w.t = S.recording ? elapsed() : 0;
+      w.el.className = "said";
+      if (S.recording) S.recCues.push({ t: w.t, text: w.text, itemIdx: w.itemIdx });
     }
+    if (w.t != null && w.t >= 0) cur = w;
   }
-  for (let i = S.words.length - 1; i >= 0; i--) if (S.words[i].t != null && S.words[i].t >= 0) { cur = S.words[i]; break; }
-  if (cur) {
-    document.querySelectorAll("#promptInner w.now").forEach(n => n.classList.remove("now"));
+  if (cur && cur !== S.nowWord) {
+    if (S.nowWord) S.nowWord.el.classList.remove("now");
     cur.el.classList.add("now"); cur.el.classList.remove("said");
+    S.nowWord = cur;
     S.liveItem = cur.itemIdx;
   }
 }
@@ -1600,7 +1629,7 @@ function buildMask(ts) {
 
 /* The window look: no matte at all. The camera sits in a framed panel on the brand
    background, which is what most broadcast graphics packages actually do. */
-const WIN = { x: 700, y: 92, w: 520, h: 536 };
+const WIN  = { x: 662, y: 76, w: 560, h: 500 };     // anchor, camera right — same box
 function drawWindow(x) {
   const R = WIN;
   x.save();
@@ -1632,7 +1661,7 @@ function roundRect(x, a, b, w, h, rad) {
   x.arcTo(a + w, b, a + w, b + h, rad); x.arcTo(a + w, b + h, a, b + h, rad);
   x.arcTo(a, b + h, a, b, rad); x.arcTo(a, b, a + w, b, rad); x.closePath();
 }
-const HERO = { x: 58, y: 104, w: 580, h: 508 };
+const HERO = { x: 58, y: 76, w: 560, h: 500 };     // picture, camera left
 function storyImg(item) {
   if (!item || !item.image) return null;
   primeImg(item);
@@ -1837,7 +1866,8 @@ function drawFrame(ts) {
     x.fillStyle = SHINE; x.fillRect(0, y - 4, OUT_W, 4);
     x.fillStyle = GREEN; x.fillRect(0, y, 12, h);
 
-    const slug = String(item.slug || "").toUpperCase().slice(0, 40);
+    const strap = strapFor(item);
+    const slug = String(strap.title || "").toUpperCase().slice(0, 40);
     let size = 54;
     setType(x, 700, size, "'Barlow Condensed','Arial Narrow',sans-serif", 1);
     while (x.measureText(slug).width > OUT_W - 150 && size > 30) {
@@ -1846,7 +1876,7 @@ function drawFrame(ts) {
     x.fillStyle = "#FFFFFF";
     x.fillText(slug, 44, y + 52);
 
-    const org = String(item.org || "").slice(0, 60);
+    const org = String(strap.sub || "").slice(0, 70);
     if (org) {
       setType(x, 600, 25, "Inter,system-ui,sans-serif", 1);
       x.fillStyle = SHINE;
@@ -2038,11 +2068,11 @@ function jumpTo(key) {
     if (i < r.a) { w.t = -1; w.el.className = "said"; }
     else { w.t = null; w.el.className = ""; }
   });
-  const shell = $("prompter").getBoundingClientRect();
-  const lineY = shell.top + shell.height * (+$("rl").value / 100);
-  const wr = S.words[r.a].el.getBoundingClientRect();
-  if (wr.height) {
-    S.scrollY += (wr.top - lineY) + 4;
+  if (!S.measured) measureWords();
+  const first = S.words[r.a];
+  if (first && first.bot != null) {
+    const el = first.el;
+    S.scrollY = Math.max(0, el.offsetTop - S.shellH * (+$("rl").value / 100) + 4);
     $("promptInner").style.transform = "translateY(" + (-S.scrollY) + "px)";
   }
 }
@@ -2157,6 +2187,7 @@ function onRecStop() {
   });
   S.armed = null;
   setTransport("none");
+  queueNormalise(S.segs[S.segs.length - 1]);
   renderSegs(); renderRundown();
   const quiet = S.recPeak < 0.02;
   toast("Segment saved — " + fmtDur(dur) + (quiet ? ". No audio was detected — check the mic before recording more." : "."), quiet);
@@ -2193,14 +2224,41 @@ $("btnStop").onclick = () => {
 /* ============================================================
    4b. THE SEGMENT STACK
    ============================================================ */
+/* the first useful clause of the read, trimmed to something a strap can hold */
+function taglineFrom(script) {
+  let t = tidy(script);
+  if (!t) return "";
+  const first = (t.match(/[^.!?]+[.!?]?/) || [t])[0].trim();
+  let out = first.replace(/[.!?]+$/, "");
+  if (out.length > 62) {
+    const cut = out.slice(0, 62);
+    const sp = cut.lastIndexOf(" ");
+    out = (sp > 30 ? cut.slice(0, sp) : cut);
+    out = out.replace(/[\s,;:]+$/, "") + "\u2026";
+  }
+  return out.replace(/[\s,;:]+$/, "");
+}
+function strapFor(item) {
+  if (!item) return null;
+  return {
+    title: (item.strapTitle != null && item.strapTitle !== "") ? item.strapTitle : (item.slug || ""),
+    sub:   (item.strapSub   != null) ? item.strapSub : taglineFrom(item.script)
+  };
+}
+
+function strapLine(it) {
+  const st = strapFor(it);
+  return "Banner: <b>" + esc(st.title.toUpperCase()) + "</b>" +
+         (st.sub ? " \u00b7 " + esc(st.sub) : "");
+}
 function armedPicture() {
   const idx = itemIdxFor(S.armed && S.armed.key);
   if (idx == null) return "On screen: the <b>Daily HERD</b> title card.";
   const it = S.items[idx];
-  if (!it.image) return "On screen: the title card \u2014 <b>this story has no picture</b>.";
-  return storyImg(it)
+  if (!it.image) return "On screen: the title card \u2014 <b>this story has no picture</b>.<br>" + strapLine(it);
+  return (storyImg(it)
     ? "On screen: <b style=\"color:var(--shine)\">" + esc(it.slug) + "</b>\u2019s picture."
-    : "Picture still loading\u2026";
+    : "Picture still loading\u2026") + "<br>" + strapLine(it);
 }
 
 function renderSegs() {
@@ -2274,7 +2332,7 @@ function renderSegs() {
     const v = this.value;
     armSlot(v === "open" || v === "close" || v === "extra" ? v : +v);
   };
-  $("segTot").textContent = S.segs.length + " recorded";
+  $("segTot").textContent = S.segs.length + " recorded" + (normProgress() ? " \u00b7 " + normProgress() : "");
   updateShowLen();
 }
 function updateShowLen() {
@@ -3151,10 +3209,15 @@ async function ffLoad() {
 
     /* GitHub caps a web upload at 25 MB, so the 30 MB core ships gzipped at
        under 10 MB and is expanded here. Downloads faster too. */
+    const mt = threads > 0 && base === FF_LOCAL;
+    plog(mt ? "Using " + threads + " processor cores."
+            : "Single core \u2014 assembly will be slower. (Upload coi.js to switch this on.)");
+    const coreName = mt ? "ffmpeg-core-mt" : "ffmpeg-core";
+
     let wasm;
     if (base === FF_LOCAL) {
       plog("Fetching the engine core (under 10 MB compressed)\u2026");
-      const gz = await fetchProgress(coreBase + "ffmpeg-core.wasm.gz", "core");
+      const gz = await fetchProgress(coreBase + coreName + ".wasm.gz", "core");
       plog("  expanding\u2026");
       if (typeof DecompressionStream === "function") {
         const ds = new DecompressionStream("gzip");
@@ -3170,11 +3233,13 @@ async function ffLoad() {
     }
     const wasmURL = URL.createObjectURL(new Blob([wasm], { type: "application/wasm" }));
 
-    const load = ff.load({ coreURL: coreBase + "ffmpeg-core.js", wasmURL });
+    const cfg = { coreURL: coreBase + coreName + ".js", wasmURL };
+    if (mt) cfg.workerURL = coreBase + coreName + ".worker.js";
+    const load = ff.load(cfg);
     const guard = new Promise((_, no) => setTimeout(() =>
       no(new Error("the engine did not finish starting within 90 seconds")), 90000));
     await Promise.race([load, guard]);
-    FF = ff; plog("Video engine ready.");
+    FF = ff; S.ffThreads = threads; plog("Video engine ready.");
     return ff;
   })();
   try { return await ffLoading; } catch (e) { ffLoading = null; throw e; }
@@ -3270,6 +3335,56 @@ async function renderSequenceFF(ff, painter, D, withSound, tag) {
   return out;
 }
 
+const NORM = { queue: [], busy: false };
+function normSpec() { return canW() + "x" + canH() + "@" + OPEN_FPS; }
+
+/* Normalise each take the moment it is recorded, while you line up the next one.
+   By the time the show is finished every clip already matches, so assembling is
+   a copy instead of an encode. */
+function queueNormalise(seg) {
+  if (!seg || seg.normBlob || NORM.queue.indexOf(seg) > -1) return;
+  NORM.queue.push(seg);
+  runNormalise();
+}
+async function runNormalise() {
+  if (NORM.busy || !NORM.queue.length) return;
+  NORM.busy = true;
+  const seg = NORM.queue.shift();
+  try {
+    const ff = await ffLoad();
+    const inName = "n_in_" + seg.id + "." + fileExt();
+    const outName = "n_out_" + seg.id + ".mp4";
+    await blobToFF(ff, inName, seg.blob);
+    const W = canW(), H = canH();
+    const a = ["-i", inName];
+    if (S.ffThreads) a.push("-threads", String(S.ffThreads));
+    a.push("-vf", "scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease," +
+                  "pad=" + W + ":" + H + ":-1:-1:color=black,setsar=1,fps=" + OPEN_FPS,
+           "-af", "aresample=48000:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo",
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+           "-r", String(OPEN_FPS), "-video_track_timescale", "30000",
+           "-c:a", "aac", "-b:a", "192k", "-y", outName);
+    await ff.exec(a);
+    const data = await ff.readFile(outName);
+    seg.normBlob = new Blob([data.buffer], { type: "video/mp4" });
+    seg.normSpec = normSpec();
+    ff.deleteFile(inName).catch(() => {});
+    ff.deleteFile(outName).catch(() => {});
+    renderSegs();
+  } catch (e) { seg.normFailed = true; }
+  NORM.busy = false;
+  if (NORM.queue.length) runNormalise();
+}
+function segReady(seg) {
+  return !!seg.normBlob && seg.normSpec === normSpec() &&
+         seg.trimIn < 0.05 && seg.trimOut > seg.dur - 0.05;
+}
+function normProgress() {
+  if (!S.segs.length) return "";
+  const done = S.segs.filter(segReady).length;
+  return done === S.segs.length ? "ready to assemble" : done + " of " + S.segs.length + " prepared";
+}
+
 async function assembleFF() {
   const ff = await ffLoad();
   const ext = fileExt();
@@ -3338,8 +3453,31 @@ async function assembleFF() {
   fc += legs + "concat=n=" + list.length + ":v=1:a=1[v][a]";
 
   const out = "show.mp4";
+
+  /* Everything already at the same size, rate and time base? Then joining is a
+     container rewrite: seconds, and not one pixel re-encoded. */
+  if (list.every(c => c.pre || c.rendered)) {
+    plog("Every clip already matches \u2014 joining without re-encoding\u2026");
+    await ff.writeFile("list.txt", new TextEncoder().encode(
+      list.map(c => "file '" + c.name + "'").join("\n") + "\n"));
+    try {
+      await ff.exec(["-f", "concat", "-safe", "0", "-i", "list.txt",
+        "-c", "copy", "-movflags", "+faststart", "-y", out]);
+      const probe = await ff.readFile(out);
+      if (probe && probe.length > 10000) {
+        const blob = new Blob([probe.buffer], { type: "video/mp4" });
+        await Promise.all(list.map(c => c.name).concat(["list.txt", out])
+          .map(f => ff.deleteFile(f).catch(() => {})));
+        plog("Done in seconds \u2014 nothing was re-encoded.");
+        return { blob, cues };
+      }
+    } catch (e) { plog("  (copy refused \u2014 encoding instead)"); }
+    await ff.deleteFile("list.txt").catch(() => {});
+  }
+
   plog("Joining " + list.length + " clip(s) and normalising every one to " +
        W + "\u00d7" + H + " at " + FPS + "fps\u2026");
+  if (S.ffThreads) args.push("-threads", String(S.ffThreads));
   args.push("-filter_complex", fc, "-map", "[v]", "-map", "[a]",
     "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
     "-r", String(FPS), "-c:a", "aac", "-b:a", "192k",
@@ -3622,15 +3760,15 @@ function pressSeg(group, value) {
   if (!hit) btns[0].setAttribute("aria-pressed", "true");
 }
 function applyDefaults() {
-  S.look = "cutout";        // camera fills the frame
+  S.look = "window";        // camera in its own frame, matching the picture
   S.mode = "off";           // no background removal
   S.bgKey = "green";        // studio green behind
-  pressSeg("segLook", "cutout");
+  pressSeg("segLook", "window");
   pressSeg("segMode", "off");
   pressSeg("segBg", "green");
   pressSeg("segMusic", "rouser");
   pressSeg("segFit", "contain");
-  $("matteBox").style.display = "";
+  $("matteBox").style.display = "none";
   $("aiBox").style.display = "none";
   $("plateBox").style.display = "none";
   if ($("musicNote")) $("musicNote").textContent =
