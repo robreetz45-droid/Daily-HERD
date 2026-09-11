@@ -378,6 +378,10 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
         <div class="pad">
           <label class="chk"><input type="checkbox" id="openOn" checked> Play the open at the top of every show</label>
           <label class="chk"><input type="checkbox" id="closeOn" checked> Play the close at the end</label>
+          <label class="chk"><input type="checkbox" id="fadeOn" checked> Fade between segments</label>
+          <div class="field" style="margin-top:8px"><label>Fade length <span class="n" id="fadeV">0.25</span> sec</label>
+            <input type="range" id="fadeLen" min="0" max="60" value="25"></div>
+          <p class="note">Each segment dips to black at its ends, so the joins land as soft transitions instead of hard jumps. It is applied when the clip is prepared, so it costs nothing at assembly.</p>
           <div class="field" style="margin-top:10px"><label>Open length</label>
             <div class="seg" id="segOpenDur">
               <button data-d="8" aria-pressed="false">8 sec</button>
@@ -1171,6 +1175,17 @@ function layoutPrompter() {
 }
 ["fsz","rl","mirror"].forEach(id => $(id).oninput = () => { $("fszV").textContent = $("fsz").value; layoutPrompter(); });
 window.addEventListener("resize", layoutPrompter);
+$("fadeLen").oninput = () => {
+  $("fadeV").textContent = (+$("fadeLen").value / 100).toFixed(2);
+  S.segs.forEach(g => { g.normBlob = null; });
+  renderSegs();
+};
+$("fadeOn").onchange = () => {
+  S.segs.forEach(g => { g.normBlob = null; });
+  renderSegs(); if (typeof normResume === "function") normResume();
+};
+function fadeSecs() { return $("fadeOn").checked ? (+$("fadeLen").value / 100) : 0; }
+
 $("spd").oninput = () => {
   $("spdV").textContent = $("spd").value;
   if ($("ovlSpd")) $("ovlSpd").textContent = $("spd").value;
@@ -2112,6 +2127,7 @@ function startCountdown() {
   if (!S.stream) return toast("Start the camera first.", true);
   if (!pv.captureStream) return toast("This browser can't record a canvas. Use Chrome or Edge.", true);
   if (!S.armed) armSlot(null);
+  NORM.waiting = NORM.waiting || NORM.queue.length > 0;
   S.cdCancel = false; S.cd = 3; S.cdT0 = performance.now();
   setTransport("count"); if ($("cdBeep").checked) beep(620, 0.11, 0.20);
   (function tick() {
@@ -2188,7 +2204,7 @@ function onRecStop() {
   S.armed = null;
   setTransport("none");
   queueNormalise(S.segs[S.segs.length - 1]);
-  renderSegs(); renderRundown();
+  renderSegs(); renderRundown(); normResume();
   const quiet = S.recPeak < 0.02;
   toast("Segment saved — " + fmtDur(dur) + (quiet ? ". No audio was detected — check the mic before recording more." : "."), quiet);
 }
@@ -3324,9 +3340,18 @@ async function renderSequenceFF(ff, painter, D, withSound, tag) {
   const args = ["-framerate", String(OPEN_FPS), "-i", tag + "%04d.jpg"];
   if (wav) args.push("-i", tag + ".wav");
   else args.push("-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo");   // real silence, never a missing track
+  const fade = Math.min(fadeSecs(), D / 4);
+  if (fade > 0.01) {
+    const outAt = (D - fade).toFixed(3);
+    args.push("-vf", "fade=t=in:st=0:d=" + fade + ",fade=t=out:st=" + outAt + ":d=" + fade,
+              "-af", "afade=t=in:st=0:d=" + fade + ",afade=t=out:st=" + outAt + ":d=" + fade);
+  }
+  if (S.ffThreads) args.push("-threads", String(S.ffThreads));
   args.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
             "-pix_fmt", "yuv420p", "-r", String(OPEN_FPS),
-            "-c:a", "aac", "-b:a", "192k", "-shortest", "-y", out);
+            "-video_track_timescale", "30000",
+            "-c:a", "aac", "-b:a", "192k", "-shortest",
+            "-avoid_negative_ts", "make_zero", "-y", out);
   await ff.exec(args);
 
   for (let i = 0; i < frames; i++)
@@ -3344,10 +3369,35 @@ function normSpec() { return canW() + "x" + canH() + "@" + OPEN_FPS; }
 function queueNormalise(seg) {
   if (!seg || seg.normBlob || NORM.queue.indexOf(seg) > -1) return;
   NORM.queue.push(seg);
-  runNormalise();
+  normResume();
 }
+function studioIsBusy() {
+  return S.recording || S.cd > 0 || S.rolling || S.tstate === "count";
+}
+/* MediaRecorder files often carry no duration in the header, so seek past the end
+   and read where it lands. The fade-out is timed against this. */
+function blobDuration(blob) {
+  return new Promise(resolve => {
+    const v = document.createElement("video");
+    v.preload = "metadata"; v.muted = true;
+    const done = d => { try { URL.revokeObjectURL(v.src); } catch (e) {} resolve(d); };
+    const t = setTimeout(() => done(0), 8000);
+    v.onloadedmetadata = () => {
+      if (isFinite(v.duration) && v.duration > 0) { clearTimeout(t); return done(v.duration); }
+      v.currentTime = 1e6;
+      v.ontimeupdate = () => {
+        if (v.currentTime > 0) { v.ontimeupdate = null; clearTimeout(t); done(v.currentTime); }
+      };
+    };
+    v.onerror = () => { clearTimeout(t); done(0); };
+    v.src = URL.createObjectURL(blob);
+  });
+}
+
 async function runNormalise() {
   if (NORM.busy || !NORM.queue.length) return;
+  if (studioIsBusy()) { NORM.waiting = true; return; }   // not while the camera is live
+  NORM.waiting = false;
   NORM.busy = true;
   const seg = NORM.queue.shift();
   try {
@@ -3358,12 +3408,25 @@ async function runNormalise() {
     const W = canW(), H = canH();
     const a = ["-i", inName];
     if (S.ffThreads) a.push("-threads", String(S.ffThreads));
-    a.push("-vf", "scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease," +
-                  "pad=" + W + ":" + H + ":-1:-1:color=black,setsar=1,fps=" + OPEN_FPS,
-           "-af", "aresample=48000:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo",
+    const realDur = (await blobDuration(seg.blob)) || seg.dur || 0;
+    const fade = Math.min(fadeSecs(), Math.max(0, realDur / 3));
+    seg.realDur = realDur;
+    let vf = "scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease," +
+             "pad=" + W + ":" + H + ":-1:-1:color=black,setsar=1,fps=" + OPEN_FPS;
+    /* apad with -shortest makes the audio end exactly where the picture does.
+       Without it every clip's sound overhangs by a tenth of a second or so, and
+       across a show those add up until the audio is running ahead of the mouths. */
+    let af = "aresample=48000:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,apad";
+    if (fade > 0.01 && realDur > fade * 2.5) {
+      const outAt = (realDur - fade).toFixed(3);
+      vf += ",fade=t=in:st=0:d=" + fade + ",fade=t=out:st=" + outAt + ":d=" + fade;
+      af += ",afade=t=in:st=0:d=" + fade + ",afade=t=out:st=" + outAt + ":d=" + fade;
+    }
+    a.push("-vf", vf, "-af", af,
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
            "-r", String(OPEN_FPS), "-video_track_timescale", "30000",
-           "-c:a", "aac", "-b:a", "192k", "-y", outName);
+           "-c:a", "aac", "-b:a", "192k", "-shortest",
+           "-avoid_negative_ts", "make_zero", "-y", outName);
     await ff.exec(a);
     const data = await ff.readFile(outName);
     seg.normBlob = new Blob([data.buffer], { type: "video/mp4" });
@@ -3373,8 +3436,10 @@ async function runNormalise() {
     renderSegs();
   } catch (e) { seg.normFailed = true; }
   NORM.busy = false;
-  if (NORM.queue.length) runNormalise();
+  if (NORM.queue.length) setTimeout(runNormalise, 400);
 }
+/* pick the work back up once recording has finished */
+function normResume() { if (NORM.queue.length && !studioIsBusy()) setTimeout(runNormalise, 800); }
 function segReady(seg) {
   return !!seg.normBlob && seg.normSpec === normSpec() &&
          seg.trimIn < 0.05 && seg.trimOut > seg.dur - 0.05;
