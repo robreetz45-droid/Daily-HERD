@@ -1182,7 +1182,7 @@ $("fadeLen").oninput = () => {
 };
 $("fadeOn").onchange = () => {
   S.segs.forEach(g => { g.normBlob = null; });
-  renderSegs(); if (typeof normResume === "function") normResume();
+  renderSegs();
 };
 function fadeSecs() { return $("fadeOn").checked ? (+$("fadeLen").value / 100) : 0; }
 
@@ -1937,8 +1937,9 @@ function drawFrame(ts) {
     x.fillRect(OUT_W - 38, 21, 6, 18); x.fillRect(OUT_W - 27, 21, 6, 18);
   }
   if (S.cd > 0) drawCountdown(x);
-  const pipx = $("pip").getContext("2d");
-  if (document.body.classList.contains("promptFull")) {
+  if (document.body.classList.contains("promptFull") && (ts - (S.pipAt || 0)) > 200) {
+    S.pipAt = ts;                       // five times a second is plenty for a thumbnail
+    const pipx = $("pip").getContext("2d");
     pipx.setTransform(1, 0, 0, 1, 0, 0); pipx.drawImage(pv, 0, 0, 320, 180);
   }
 }
@@ -1982,21 +1983,29 @@ function drawCaption(x) {
 /* --- main loop --- */
 let prev = performance.now();
 let paintErr = 0, fpsN = 0, fpsT0 = performance.now();
+const DRAW_HZ = 30;
+let lastDraw = 0, lastTc = 0;
 function loop(t) {
   const dt = Math.min(0.05, (t - prev) / 1000); prev = t;
   try {
   promptTick(dt);
-  if (!S.openPreview) drawFrame(t);
+  /* The recorder samples thirty times a second. Drawing sixty times, which is
+     what the screen asks for, threw half of every frame's work away — and that
+     wasted half is what tipped the machine into dropping real frames. */
+  if (t - lastDraw >= (1000 / DRAW_HZ) - 1.5) {
+    lastDraw = t;
+    if (!S.openPreview) drawFrame(t);
+    fpsN++;
+  }
   if (S.recording) {
-    $("tc").textContent = fmtTC(elapsed());
+    if (t - lastTc > 100) { lastTc = t; $("tc").textContent = fmtTC(elapsed()); }
     if (!S.paused && S.level > S.recPeak) S.recPeak = S.level;
   }
-  fpsN++;
   if (t - fpsT0 > 1000) {
     S.fps = Math.round(fpsN * 1000 / (t - fpsT0)); fpsN = 0; fpsT0 = t;
     const e = $("mFps");
     e.textContent = S.fps;
-    e.style.color = S.fps >= 24 ? "var(--shine)" : S.fps >= 15 ? "var(--amber)" : "var(--tally)";
+    e.style.color = S.fps >= 28 ? "var(--shine)" : S.fps >= 20 ? "var(--amber)" : "var(--tally)";
     if (S.recording && S.fps < 15 && !S.warnedFps) {
       S.warnedFps = true;
       toast("Only " + S.fps + " frames a second are being captured. Switch the codec to H.264 or drop to 720p.", true);
@@ -2204,7 +2213,7 @@ function onRecStop() {
   S.armed = null;
   setTransport("none");
   queueNormalise(S.segs[S.segs.length - 1]);
-  renderSegs(); renderRundown(); normResume();
+  renderSegs(); renderRundown();
   const quiet = S.recPeak < 0.02;
   toast("Segment saved — " + fmtDur(dur) + (quiet ? ". No audio was detected — check the mic before recording more." : "."), quiet);
 }
@@ -2348,7 +2357,7 @@ function renderSegs() {
     const v = this.value;
     armSlot(v === "open" || v === "close" || v === "extra" ? v : +v);
   };
-  $("segTot").textContent = S.segs.length + " recorded" + (normProgress() ? " \u00b7 " + normProgress() : "");
+  $("segTot").textContent = S.segs.length + " recorded";
   updateShowLen();
 }
 function updateShowLen() {
@@ -3363,16 +3372,12 @@ async function renderSequenceFF(ff, painter, D, withSound, tag) {
 const NORM = { queue: [], busy: false };
 function normSpec() { return canW() + "x" + canH() + "@" + OPEN_FPS; }
 
-/* Normalise each take the moment it is recorded, while you line up the next one.
-   By the time the show is finished every clip already matches, so assembling is
-   a copy instead of an encode. */
+/* Used only by the assembly stage. Nothing calls this while the camera is on:
+   a video encoder running beside a live capture starves the capture, and the
+   recording itself comes out stuttering. All the encoding happens at the end. */
 function queueNormalise(seg) {
   if (!seg || seg.normBlob || NORM.queue.indexOf(seg) > -1) return;
   NORM.queue.push(seg);
-  normResume();
-}
-function studioIsBusy() {
-  return S.recording || S.cd > 0 || S.rolling || S.tstate === "count";
 }
 /* MediaRecorder files often carry no duration in the header, so seek past the end
    and read where it lands. The fade-out is timed against this. */
@@ -3396,8 +3401,6 @@ function blobDuration(blob) {
 
 async function runNormalise() {
   if (NORM.busy || !NORM.queue.length) return;
-  if (studioIsBusy()) { NORM.waiting = true; return; }   // not while the camera is live
-  NORM.waiting = false;
   NORM.busy = true;
   const seg = NORM.queue.shift();
   try {
@@ -3436,10 +3439,7 @@ async function runNormalise() {
     renderSegs();
   } catch (e) { seg.normFailed = true; }
   NORM.busy = false;
-  if (NORM.queue.length) setTimeout(runNormalise, 400);
 }
-/* pick the work back up once recording has finished */
-function normResume() { if (NORM.queue.length && !studioIsBusy()) setTimeout(runNormalise, 800); }
 function segReady(seg) {
   return !!seg.normBlob && seg.normSpec === normSpec() &&
          seg.trimIn < 0.05 && seg.trimOut > seg.dur - 0.05;
@@ -3453,6 +3453,18 @@ function normProgress() {
 async function assembleFF() {
   const ff = await ffLoad();
   const ext = fileExt();
+
+  /* Prepare each take now, in order, with the camera idle and nothing competing. */
+  for (let i = 0; i < S.segs.length; i++) {
+    const tk = S.segs[i];
+    if (segReady(tk)) continue;
+    plog("Preparing " + (i + 1) + "/" + S.segs.length + " \u00b7 " + tk.label + "\u2026");
+    pbar((i + 0.5) / (S.segs.length + 2));
+    queueNormalise(tk);
+    await runNormalise();
+    if (cancelAssembly) throw new Error("stopped");
+  }
+
   const oD = $("openOn").checked ? openDur() : 0;
   const cD = $("closeOn").checked ? 5 : 0;
   const list = [], cues = [];
