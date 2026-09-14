@@ -687,7 +687,7 @@ const S = {
   stream: null, audioStream: null,
   mode: "off", look: "window", bgKey: "green", anchor: "right",
   autoInv: false, invSum: 0, invN: 0, invDone: false, maskOK: false, shownKey: "open",
-  measured: false, shellH: 360, maxScroll: null, nowWord: null, lastSeg: 0, maskReady: false,
+  mirror: true, measured: false, shellH: 360, maxScroll: null, nowWord: null, lastSeg: 0, maskReady: false,
   segmenter: null, aiReady: false, plate: null,
   rolling: false, scrollY: 0, lastRAF: 0,
   recording: false, recStart: 0, recCues: [], tstate: "none",
@@ -1707,6 +1707,40 @@ function loadHero(file) {
   r.readAsDataURL(file);
 }
 /* whatever is standing where the big MV normally stands */
+function drawLower(x, item) {
+  if (!$("gLower").checked || !item) return;
+  /* full bleed, so it reads as a broadcast strap rather than a floating box */
+  const h = 112, y = OUT_H - h;
+  x.fillStyle = "rgba(4,20,13,.90)"; x.fillRect(0, y, OUT_W, h);
+  x.fillStyle = SHINE; x.fillRect(0, y - 4, OUT_W, 4);
+  x.fillStyle = GREEN; x.fillRect(0, y, 12, h);
+
+  const strap = strapFor(item);
+  const slug = String(strap.title || "").toUpperCase().slice(0, 40);
+  let size = 54;
+  setType(x, 700, size, "'Barlow Condensed','Arial Narrow',sans-serif", 1);
+  while (x.measureText(slug).width > OUT_W - 150 && size > 30) {
+    size -= 2; setType(x, 700, size, "'Barlow Condensed','Arial Narrow',sans-serif", 1);
+  }
+  x.fillStyle = "#FFFFFF";
+  x.fillText(slug, 44, y + 52);
+
+  const org = String(strap.sub || "").slice(0, 70);
+  if (org) {
+    setType(x, 600, 25, "Inter,system-ui,sans-serif", 1);
+    x.fillStyle = SHINE;
+    x.fillText(org, 46, y + 88);
+  }
+  try { x.letterSpacing = "0px"; } catch (e) {}
+}
+function drawBug(x) {
+  if (!$("gBug").checked) return;
+  if (bugImg.complete) x.drawImage(bugImg, OUT_W - 190, 34, 132, bugImg.height * 132 / bugImg.width);
+  x.fillStyle = "rgba(255,255,255,.85)"; x.font = "600 15px Inter, sans-serif"; x.textAlign = "right";
+  x.fillText(today().toUpperCase(), OUT_W - 58, 130);
+  x.textAlign = "left";
+}
+
 function drawHero(x, item) {
   const R = HERO;
   let im = $("gImg").checked ? storyImg(item) : null;
@@ -1874,38 +1908,8 @@ function drawFrame(ts) {
   const idx = liveIdx;
   const item = (idx != null && S.items[idx]) ? S.items[idx] : null;
 
-  if ($("gLower").checked && item) {
-    /* full bleed, so it reads as a broadcast strap rather than a floating box */
-    const h = 112, y = OUT_H - h;
-    x.fillStyle = "rgba(4,20,13,.90)"; x.fillRect(0, y, OUT_W, h);
-    x.fillStyle = SHINE; x.fillRect(0, y - 4, OUT_W, 4);
-    x.fillStyle = GREEN; x.fillRect(0, y, 12, h);
-
-    const strap = strapFor(item);
-    const slug = String(strap.title || "").toUpperCase().slice(0, 40);
-    let size = 54;
-    setType(x, 700, size, "'Barlow Condensed','Arial Narrow',sans-serif", 1);
-    while (x.measureText(slug).width > OUT_W - 150 && size > 30) {
-      size -= 2; setType(x, 700, size, "'Barlow Condensed','Arial Narrow',sans-serif", 1);
-    }
-    x.fillStyle = "#FFFFFF";
-    x.fillText(slug, 44, y + 52);
-
-    const org = String(strap.sub || "").slice(0, 70);
-    if (org) {
-      setType(x, 600, 25, "Inter,system-ui,sans-serif", 1);
-      x.fillStyle = SHINE;
-      x.fillText(org, 46, y + 88);
-    }
-    try { x.letterSpacing = "0px"; } catch (e) {}
-  }
-
-  if ($("gBug").checked) {
-    if (bugImg.complete) x.drawImage(bugImg, OUT_W - 190, 34, 132, bugImg.height * 132 / bugImg.width);
-    x.fillStyle = "rgba(255,255,255,.85)"; x.font = "600 15px Inter, sans-serif"; x.textAlign = "right";
-    x.fillText(today().toUpperCase(), OUT_W - 58, 130);
-    x.textAlign = "left";
-  }
+  drawLower(x, item);
+  drawBug(x);
 
   if ($("gCap").checked) drawCaption(x);
 
@@ -2177,11 +2181,25 @@ function drawCountdown(x) {
 
 /* --- roll --- */
 function beginRec() {
-  const cs = pv.captureStream(30);
   if (S.ac && S.ac.state === "suspended") S.ac.resume();
   const atracks = audioReady() ? S.audioOut.stream.getAudioTracks() : S.stream.getAudioTracks();
-  atracks.forEach(t => cs.addTrack(t));
-  if (!atracks.length) toast("Recording with no microphone — this segment will be silent. Run Mic check.", true);
+  if (!atracks.length) toast("Recording with no microphone \u2014 this segment will be silent. Run Mic check.", true);
+
+  /* The camera track straight from the device. Frames arrive on the hardware's
+     clock, so nothing the page does can drop one. The graphics are added later. */
+  const vtracks = S.stream.getVideoTracks();
+  const direct = vtracks.length > 0 && S.mode === "off";
+  let cs;
+  if (direct) {
+    try { vtracks[0].contentHint = "motion"; } catch (e) {}
+    cs = new MediaStream(vtracks.concat(atracks));
+  } else {
+    /* AI cutout needs a mask drawn per frame, so that one still films the canvas */
+    if (!pv.captureStream) return toast("This browser can't record. Use Chrome or Edge.", true);
+    cs = pv.captureStream(30);
+    atracks.forEach(t => cs.addTrack(t));
+  }
+  S.recDirect = direct;
   S.chunks = []; S.recCues = []; S.discard = false;
   S.paused = false; S.pausedTotal = 0; S.pausedAt = 0;
   S.recorder = new MediaRecorder(cs, { mimeType: pickMime(), videoBitsPerSecond: +$("qual").value, audioBitsPerSecond: 128000 });
@@ -2207,6 +2225,7 @@ function onRecStop() {
   const key = S.armed ? S.armed.key : nextKey();
   S.segs.push({
     id: "s" + Date.now(), key: key, blob, url: URL.createObjectURL(blob), dur,
+    direct: S.recDirect, shownKey: S.shownKey,
     cues: S.recCues.slice(), trimIn: 0, trimOut: dur,
     label: slotLabel(key), org: slotOrg(key)
   });
@@ -3414,21 +3433,66 @@ async function runNormalise() {
     const realDur = (await blobDuration(seg.blob)) || seg.dur || 0;
     const fade = Math.min(fadeSecs(), Math.max(0, realDur / 3));
     seg.realDur = realDur;
-    let vf = "scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease," +
-             "pad=" + W + ":" + H + ":-1:-1:color=black,setsar=1,fps=" + OPEN_FPS;
+    const FPS = OPEN_FPS;
+
     /* apad with -shortest makes the audio end exactly where the picture does.
-       Without it every clip's sound overhangs by a tenth of a second or so, and
-       across a show those add up until the audio is running ahead of the mouths. */
+       Without it every clip's sound overhangs slightly, and across a show those
+       add up until the audio is running ahead of the mouths. */
     let af = "aresample=48000:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,apad";
     if (fade > 0.01 && realDur > fade * 2.5) {
       const outAt = (realDur - fade).toFixed(3);
-      vf += ",fade=t=in:st=0:d=" + fade + ",fade=t=out:st=" + outAt + ":d=" + fade;
       af += ",afade=t=in:st=0:d=" + fade + ",afade=t=out:st=" + outAt + ":d=" + fade;
+    }
+
+    if (seg.direct) {
+      /* ---- the camera was recorded clean; the graphics go on now ----
+         The overlay is a still image, so this is one composite per frame with
+         no chance of a dropped or duplicated frame anywhere in it. */
+      const R = camRect();
+      const png = "ov_" + seg.id + ".png";
+      await blobToFF(ff, png, await overlayPNG(seg.shownKey || S.shownKey));
+
+      let chain =
+        "[0:v]" + (S.mirror === false ? "" : "hflip,") +
+        "scale=" + R.w + ":" + R.h + ":force_original_aspect_ratio=increase," +
+        "crop=" + R.w + ":" + R.h + ",setsar=1,fps=" + FPS + "[cam];" +
+        "color=c=black:s=" + W + "x" + H + ":r=" + FPS + "[bgc];" +
+        "[bgc][cam]overlay=" + R.x + ":" + R.y + ":shortest=1[u];" +
+        "[u][1:v]overlay=0:0:format=auto:shortest=1[vv]";
+      if (fade > 0.01 && realDur > fade * 2.5) {
+        const outAt = (realDur - fade).toFixed(3);
+        chain += ";[vv]fade=t=in:st=0:d=" + fade + ",fade=t=out:st=" + outAt + ":d=" + fade + "[v]";
+      } else chain += ";[vv]null[v]";
+
+      const a2 = ["-i", inName, "-loop", "1", "-i", png];
+      if (S.ffThreads) a2.push("-threads", String(S.ffThreads));
+      a2.push("-filter_complex", chain, "-map", "[v]", "-map", "0:a?", "-af", af,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+        "-r", String(FPS), "-video_track_timescale", "30000",
+        "-c:a", "aac", "-b:a", "192k", "-t", realDur.toFixed(3),
+        "-avoid_negative_ts", "make_zero", "-y", outName);
+      await ff.exec(a2);
+      ff.deleteFile(png).catch(() => {});
+      const data0 = await ff.readFile(outName);
+      seg.normBlob = new Blob([data0.buffer], { type: "video/mp4" });
+      seg.normSpec = normSpec();
+      ff.deleteFile(inName).catch(() => {});
+      ff.deleteFile(outName).catch(() => {});
+      renderSegs();
+      NORM.busy = false;
+      return;
+    }
+
+    let vf = "scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease," +
+             "pad=" + W + ":" + H + ":-1:-1:color=black,setsar=1,fps=" + FPS;
+    if (fade > 0.01 && realDur > fade * 2.5) {
+      const outAt = (realDur - fade).toFixed(3);
+      vf += ",fade=t=in:st=0:d=" + fade + ",fade=t=out:st=" + outAt + ":d=" + fade;
     }
     a.push("-vf", vf, "-af", af,
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-           "-r", String(OPEN_FPS), "-video_track_timescale", "30000",
-           "-c:a", "aac", "-b:a", "192k", "-shortest",
+           "-r", String(FPS), "-video_track_timescale", "30000",
+           "-c:a", "aac", "-b:a", "192k", "-t", realDur.toFixed(3),
            "-avoid_negative_ts", "make_zero", "-y", outName);
     await ff.exec(a);
     const data = await ff.readFile(outName);
@@ -3448,6 +3512,52 @@ function normProgress() {
   if (!S.segs.length) return "";
   const done = S.segs.filter(segReady).length;
   return done === S.segs.length ? "ready to assemble" : done + " of " + S.segs.length + " prepared";
+}
+
+/* the rectangle the camera occupies, in output pixels */
+function camRect() {
+  const r = resFactor();
+  const R = (S.look === "window") ? WIN : { x: 0, y: 0, w: OUT_W, h: OUT_H };
+  return { x: Math.round(R.x * r), y: Math.round(R.y * r),
+           w: Math.round(R.w * r), h: Math.round(R.h * r), rounded: S.look === "window" };
+}
+
+/* One PNG holding the backdrop, the story picture, the banner and the bug,
+   with the camera window punched out so the video shows through. */
+function overlayPNG(shownKey) {
+  const c = document.createElement("canvas");
+  c.width = canW(); c.height = canH();
+  const x = c.getContext("2d");
+  stage(x);
+
+  const bg = bgImgs[S.bgKey];
+  if (bg && bg.complete) x.drawImage(bg, 0, 0, OUT_W, OUT_H);
+  else { x.fillStyle = "#062A1A"; x.fillRect(0, 0, OUT_W, OUT_H); }
+
+  const idx = itemIdxFor(shownKey);
+  const item = (idx != null && S.items[idx]) ? S.items[idx] : null;
+  drawHero(x, item);
+
+  if (S.look === "window") {
+    const R = WIN;
+    x.save(); x.shadowColor = "rgba(0,0,0,.55)"; x.shadowBlur = 40; x.shadowOffsetY = 16;
+    roundRect(x, R.x, R.y, R.w, R.h, 18); x.fillStyle = "#0B1A13"; x.fill(); x.restore();
+    x.strokeStyle = SHINE; x.lineWidth = 3;
+    roundRect(x, R.x + 3, R.y + 3, R.w - 6, R.h - 6, 16); x.stroke();
+  }
+
+  drawLower(x, item);
+  drawBug(x);
+
+  /* punch the hole last, so the border and bug survive above the video */
+  x.save();
+  x.globalCompositeOperation = "destination-out";
+  if (S.look === "window") roundRect(x, WIN.x + 5, WIN.y + 5, WIN.w - 10, WIN.h - 10, 13);
+  else { x.beginPath(); x.rect(0, 0, OUT_W, OUT_H); }
+  x.fillStyle = "#000"; x.fill();
+  x.restore();
+
+  return new Promise(res => c.toBlob(res, "image/png"));
 }
 
 async function assembleFF() {
