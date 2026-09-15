@@ -2225,7 +2225,7 @@ function onRecStop() {
   const key = S.armed ? S.armed.key : nextKey();
   S.segs.push({
     id: "s" + Date.now(), key: key, blob, url: URL.createObjectURL(blob), dur,
-    direct: S.recDirect, shownKey: S.shownKey,
+    direct: S.recDirect, shownKey: S.shownKey, look: S.look, bgKey: S.bgKey,
     cues: S.recCues.slice(), trimIn: 0, trimOut: dur,
     label: slotLabel(key), org: slotOrg(key)
   });
@@ -3456,9 +3456,10 @@ async function runNormalise() {
       /* ---- the camera was recorded clean; the graphics go on now ----
          The overlay is a still image, so this is one composite per frame with
          no chance of a dropped or duplicated frame anywhere in it. */
-      const R = camRect();
+      const look = seg.look || S.look || "window";
+      const R = camRect(look);
       const png = "ov_" + seg.id + ".png";
-      await blobToFF(ff, png, await overlayPNG(seg.shownKey || S.shownKey));
+      await blobToFF(ff, png, await overlayPNG(seg.shownKey || S.shownKey, look, seg.bgKey));
 
       let chain =
         "[0:v]" + (S.mirror === false ? "" : "hflip,") +
@@ -3505,7 +3506,11 @@ async function runNormalise() {
     ff.deleteFile(inName).catch(() => {});
     ff.deleteFile(outName).catch(() => {});
     renderSegs();
-  } catch (e) { seg.normFailed = true; }
+  } catch (e) {
+    seg.normFailed = true;
+    plog("  (preparing \u201c" + seg.label + "\u201d failed: " + (e && e.message || e) + ")");
+    console.error("normalise:", e);
+  }
   NORM.busy = false;
 }
 function segReady(seg) {
@@ -3519,22 +3524,23 @@ function normProgress() {
 }
 
 /* the rectangle the camera occupies, in output pixels */
-function camRect() {
+function camRect(look) {
   const r = resFactor();
-  const R = (S.look === "window") ? WIN : { x: 0, y: 0, w: OUT_W, h: OUT_H };
+  const R = ((look || S.look) === "window") ? WIN : { x: 0, y: 0, w: OUT_W, h: OUT_H };
   return { x: Math.round(R.x * r), y: Math.round(R.y * r),
            w: Math.round(R.w * r), h: Math.round(R.h * r), rounded: S.look === "window" };
 }
 
 /* One PNG holding the backdrop, the story picture, the banner and the bug,
    with the camera window punched out so the video shows through. */
-function overlayPNG(shownKey) {
+function overlayPNG(shownKey, look, bgKey) {
+  look = look || S.look || "window";
   const c = document.createElement("canvas");
   c.width = canW(); c.height = canH();
   const x = c.getContext("2d");
   stage(x);
 
-  const bg = bgImgs[S.bgKey];
+  const bg = bgImgs[bgKey || S.bgKey];
   if (bg && bg.complete) x.drawImage(bg, 0, 0, OUT_W, OUT_H);
   else { x.fillStyle = "#062A1A"; x.fillRect(0, 0, OUT_W, OUT_H); }
 
@@ -3542,7 +3548,7 @@ function overlayPNG(shownKey) {
   const item = (idx != null && S.items[idx]) ? S.items[idx] : null;
   drawHero(x, item);
 
-  if (S.look === "window") {
+  if (look === "window") {
     const R = WIN;
     x.save(); x.shadowColor = "rgba(0,0,0,.55)"; x.shadowBlur = 40; x.shadowOffsetY = 16;
     roundRect(x, R.x, R.y, R.w, R.h, 18); x.fillStyle = "#0B1A13"; x.fill(); x.restore();
@@ -3556,7 +3562,7 @@ function overlayPNG(shownKey) {
   /* punch the hole last, so the border and bug survive above the video */
   x.save();
   x.globalCompositeOperation = "destination-out";
-  if (S.look === "window") roundRect(x, WIN.x + 5, WIN.y + 5, WIN.w - 10, WIN.h - 10, 13);
+  if (look === "window") roundRect(x, WIN.x + 5, WIN.y + 5, WIN.w - 10, WIN.h - 10, 13);
   else { x.beginPath(); x.rect(0, 0, OUT_W, OUT_H); }
   x.fillStyle = "#000"; x.fill();
   x.restore();
@@ -3586,12 +3592,22 @@ async function assembleFF() {
 
   if (oD) {
     plog("Rendering the open frame by frame (" + Math.round(oD * OPEN_FPS) + " frames)\u2026");
-    list.push({ name: await renderSequenceFF(ff, drawOpen, oD, true, "open"), dur: oD });
+    list.push({ name: await renderSequenceFF(ff, drawOpen, oD, true, "open"), dur: oD, rendered: true });
     offset += oD;
   }
 
   for (let i = 0; i < S.segs.length; i++) {
     const tk = S.segs[i];
+    if (segReady(tk)) {
+      /* already composited and encoded to the shared spec — use it as is */
+      const pre = "p" + i + ".mp4";
+      plog("Segment " + (i + 1) + "/" + S.segs.length + " \u00b7 " + tk.label + " (prepared)");
+      await blobToFF(ff, pre, tk.normBlob);
+      list.push({ name: pre, dur: tk.realDur || tk.dur, pre: true });
+      tk.cues.forEach(q => cues.push({ t: q.t + offset, text: q.text, itemIdx: q.itemIdx }));
+      offset += tk.realDur || tk.dur;
+      continue;
+    }
     const trimmed = tk.trimIn > 0.05 || tk.trimOut < tk.dur - 0.05;
     const raw = "r" + i + "." + ext, cut = "c" + i + "." + ext;
     plog("Segment " + (i + 1) + "/" + S.segs.length + " \u00b7 " + tk.label + (trimmed ? " (trimming)" : ""));
@@ -3614,7 +3630,7 @@ async function assembleFF() {
 
   if (cD) {
     plog("Rendering the close\u2026");
-    list.push({ name: await renderSequenceFF(ff, drawClose, cD, false, "close"), dur: cD });
+    list.push({ name: await renderSequenceFF(ff, drawClose, cD, false, "close"), dur: cD, rendered: true });
   }
 
   /* ------------------------------------------------------------------
