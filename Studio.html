@@ -242,7 +242,11 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
 .segcard{border:1px solid var(--line);border-left:3px solid var(--turf-lite);background:var(--panel);
   border-radius:var(--r);margin-bottom:9px;overflow:hidden}
 .segcard.open{border-left-color:var(--shine)}
-.segcard video{width:100%;display:block;background:#000;aspect-ratio:16/9}
+.sc-stage{position:relative;width:100%;aspect-ratio:16/9;background:#06170F;overflow:hidden}
+.sc-stage video{position:absolute;object-fit:cover;background:#000;transform:scaleX(-1)}
+.sc-stage .sc-ov{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.sc-stage .sc-play{position:absolute;left:0;right:0;bottom:0;height:34px;opacity:0;width:100%}
+.segcard video{display:block;background:#000}
 .sc-h{display:grid;grid-template-columns:26px 1fr auto;gap:8px;align-items:baseline;padding:9px 10px 6px}
 .sc-h .sc-n{font-family:var(--mono);font-size:11px;color:var(--shine)}
 .sc-h b{font-family:var(--display);font-size:17px;letter-spacing:.05em;text-transform:uppercase;line-height:1.05}
@@ -2305,6 +2309,39 @@ function armedPicture() {
     : "Picture still loading\u2026") + "<br>" + strapLine(it);
 }
 
+/* The take on disk is bare camera — the graphics are added at assembly. So the
+   preview places the video exactly where the window sits and lays the real
+   overlay on top, which is what the finished show will look like. */
+const ovCache = new Map();
+function dressPreview(card, seg) {
+  const stage = card.querySelector(".sc-stage");
+  const vid = card.querySelector("video");
+  const img = card.querySelector(".sc-ov");
+  if (!stage || !vid) return;
+  const look = seg.look || S.look || "window";
+  if (look === "window") {
+    vid.style.left   = (WIN.x / OUT_W * 100) + "%";
+    vid.style.top    = (WIN.y / OUT_H * 100) + "%";
+    vid.style.width  = (WIN.w / OUT_W * 100) + "%";
+    vid.style.height = (WIN.h / OUT_H * 100) + "%";
+    vid.style.borderRadius = "2%";
+  } else {
+    vid.style.left = "0"; vid.style.top = "0";
+    vid.style.width = "100%"; vid.style.height = "100%";
+    vid.style.borderRadius = "0";
+  }
+  const key = [seg.id, seg.shownKey, look, seg.bgKey || S.bgKey,
+               S.items.map(it => (it.slug || "") + (it.image ? 1 : 0) +
+                 (it.strapTitle || "") + (it.strapSub || "")).join("|")].join("~");
+  if (ovCache.has(key)) { img.src = ovCache.get(key); return; }
+  overlayPNG(seg.shownKey, look, seg.bgKey).then(blob => {
+    if (!blob) return;
+    const url = URL.createObjectURL(blob);
+    ovCache.set(key, url);
+    img.src = url;
+  }).catch(() => {});
+}
+
 function renderSegs() {
   const box = $("segList"); if (!box) return;
   box.innerHTML = "";
@@ -2315,14 +2352,19 @@ function renderSegs() {
       '<div class="sc-h"><span class="sc-n">' + String(i + 1).padStart(2, "0") + '</span>' +
       '<b>' + esc(g.label) + '</b><span class="sc-d">' + fmtDur(g.trimOut - g.trimIn) + '</span>' +
       (g.org ? '<span class="sc-org">' + esc(g.org) + '</span>' : '') + '</div>' +
-      '<video src="' + g.url + '" controls preload="metadata"></video>' +
+      '<div class="sc-stage" data-stage="' + i + '">' +
+        '<video src="' + g.url + '" controls controlsList="nofullscreen nodownload" disablePictureInPicture preload="metadata"></video>' +
+        '<img class="sc-ov" alt="">' +
+      '</div>' +
       '<div class="sc-b">' +
       '<div class="trim"><span>IN</span><input type="range" data-r="in" min="0" max="' + g.dur.toFixed(2) + '" step="0.05" value="' + g.trimIn + '"></div>' +
       '<div class="trim" style="margin-top:4px"><span>OUT</span><input type="range" data-r="out" min="0" max="' + g.dur.toFixed(2) + '" step="0.05" value="' + g.trimOut + '"></div>' +
+      '<div class="hint" style="margin-top:6px">Framed as it will appear. The graphics are added when you assemble.</div>' +
       '<div class="sc-a"><button data-a="up">↑</button><button data-a="dn">↓</button>' +
       '<button data-a="re">Retake</button><button data-a="rn">Rename</button>' +
       '<button data-a="dl">Save</button><button class="del" data-a="rm">Delete</button></div></div>';
     const vid = d.querySelector("video");
+    dressPreview(d, g);
     d.querySelectorAll("input[data-r]").forEach(r => r.oninput = () => {
       const v = +r.value;
       if (r.dataset.r === "in") { g.trimIn = Math.min(v, g.trimOut - 0.2); r.value = g.trimIn; }
@@ -3353,7 +3395,22 @@ function blobFromCanvas(c, q) {
 }
 
 /* draw every frame, write it to the engine, then encode at a fixed rate */
+const seqCache = new Map();
+function seqKey(tag, D) {
+  return [tag, D, canW(), S.bgKey, ($("openTag") ? $("openTag").value : ""),
+          today(), musicMode(), fadeSecs(), customAudio ? 1 : 0].join("~");
+}
+
 async function renderSequenceFF(ff, painter, D, withSound, tag) {
+  /* The open is the same every time until something about it changes, so build
+     it once per session rather than on every attempt. */
+  const key = seqKey(tag, D);
+  const hit = seqCache.get(key);
+  if (hit) {
+    await ff.writeFile(hit.name, hit.bytes);
+    plog("   (" + tag + " reused from earlier)");
+    return hit.name;
+  }
   const c = document.createElement("canvas"); c.width = canW(); c.height = canH();
   const x = c.getContext("2d"); x.imageSmoothingQuality = "high";
   await fontsReady();
@@ -3367,7 +3424,11 @@ async function renderSequenceFF(ff, painter, D, withSound, tag) {
     const b = await blobFromCanvas(c, 0.88);
     await ff.writeFile(tag + String(i).padStart(4, "0") + ".jpg",
       new Uint8Array(await b.arrayBuffer()));
-    if (i % 15 === 0) { pbar(i / frames); await new Promise(r => setTimeout(r, 0)); }
+    if (i % 15 === 0) {
+      pbar(i / frames);
+      if (i && i % 90 === 0) plog("   drawing \u2026 " + i + " of " + frames + " frames");
+      await new Promise(r => setTimeout(r, 0));
+    }
   }
 
   const wav = withSound ? await renderSting(D) : null;
@@ -3387,15 +3448,34 @@ async function renderSequenceFF(ff, painter, D, withSound, tag) {
   if (S.ffThreads) args.push("-threads", String(S.ffThreads));
   args.push(...encFlags(), "-t", D.toFixed(3),
             "-avoid_negative_ts", "make_zero", "-y", out);
-  await ff.exec(args);
+  await runStep(ff, args, "rendering the " + tag, 12);
 
   for (let i = 0; i < frames; i++)
     ff.deleteFile(tag + String(i).padStart(4, "0") + ".jpg").catch(() => {});
   if (wav) ff.deleteFile(tag + ".wav").catch(() => {});
+  try { seqCache.set(key, { name: out, bytes: await ff.readFile(out) }); } catch (e) {}
   return out;
 }
 
 const NORM = { queue: [], busy: false };
+let stepT0 = 0;
+function step(msg) { stepT0 = Date.now(); plog(msg); }
+function stepDone(extra) {
+  const secs = ((Date.now() - stepT0) / 1000).toFixed(0);
+  plog("   \u2713 " + secs + "s" + (extra ? " \u00b7 " + extra : ""));
+}
+
+/* One ffmpeg run, with a ceiling. A wedged run used to look exactly like a slow
+   one, and there was no way to tell them apart from the outside. */
+async function runStep(ff, args, label, limitMin) {
+  const limit = (limitMin || 10) * 60000;
+  let done = false;
+  const guard = new Promise((_, no) => setTimeout(() => {
+    if (!done) no(new Error(label + " took longer than " + (limitMin || 10) +
+      " minutes and was stopped. Try 720p in Camera, mic & quality, or fewer segments."));
+  }, limit));
+  try { await Promise.race([ff.exec(args), guard]); } finally { done = true; }
+}
 
 function encFlags() {
   return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
@@ -3417,6 +3497,23 @@ function queueNormalise(seg) {
 }
 /* MediaRecorder files often carry no duration in the header, so seek past the end
    and read where it lands. The fade-out is timed against this. */
+/* stopwatch is what the studio timed while recording; probed is what the browser
+   says. Take the probe only when the two roughly agree. */
+function sensibleDuration(probed, stopwatch, label) {
+  const sw = (isFinite(stopwatch) && stopwatch > 0.2) ? stopwatch : 0;
+  const ok = isFinite(probed) && probed > 0.2 && probed < 7200;
+  let out;
+  if (ok && sw) {
+    const slack = Math.max(2, sw * 0.5);
+    out = Math.abs(probed - sw) <= slack ? probed : sw;
+    if (out !== probed)
+      plog("   (measured " + probed.toFixed(1) + "s for \u201c" + label +
+           "\u201d but it was timed at " + sw.toFixed(1) + "s \u2014 using the timer)");
+  } else out = ok ? probed : sw;
+  if (!out || !isFinite(out)) out = 10;
+  return Math.min(Math.max(out, 0.5), 1800);      // never longer than half an hour
+}
+
 function blobDuration(blob) {
   return new Promise(resolve => {
     const v = document.createElement("video");
@@ -3427,7 +3524,10 @@ function blobDuration(blob) {
       if (isFinite(v.duration) && v.duration > 0) { clearTimeout(t); return done(v.duration); }
       v.currentTime = 1e6;
       v.ontimeupdate = () => {
-        if (v.currentTime > 0) { v.ontimeupdate = null; clearTimeout(t); done(v.currentTime); }
+        if (v.currentTime > 0) {
+          v.ontimeupdate = null; clearTimeout(t);
+          done(v.currentTime > 7200 ? 0 : v.currentTime);   // a seek that did not clamp
+        }
       };
     };
     v.onerror = () => { clearTimeout(t); done(0); };
@@ -3447,7 +3547,8 @@ async function runNormalise() {
     const W = canW(), H = canH();
     const a = ["-i", inName];
     if (S.ffThreads) a.push("-threads", String(S.ffThreads));
-    const realDur = (await blobDuration(seg.blob)) || seg.dur || 0;
+    const probed = await blobDuration(seg.blob);
+    const realDur = sensibleDuration(probed, seg.dur, seg.label);
     const fade = Math.min(fadeSecs(), Math.max(0, realDur / 3));
     seg.realDur = realDur;
     const FPS = OPEN_FPS;
@@ -3487,7 +3588,7 @@ async function runNormalise() {
       a2.push("-filter_complex", chain, "-map", "[v]", "-map", "0:a?", "-af", af,
         ...encFlags(), "-t", realDur.toFixed(3),
         "-avoid_negative_ts", "make_zero", "-y", outName);
-      await ff.exec(a2);
+      await runStep(ff, a2, "compositing \u201c" + seg.label + "\u201d", 12);
       ff.deleteFile(png).catch(() => {});
       const data0 = await ff.readFile(outName);
       seg.normBlob = new Blob([data0.buffer], { type: "video/mp4" });
@@ -3508,7 +3609,7 @@ async function runNormalise() {
     a.push("-vf", vf, "-af", af,
            ...encFlags(), "-t", realDur.toFixed(3),
            "-avoid_negative_ts", "make_zero", "-y", outName);
-    await ff.exec(a);
+    await runStep(ff, a, "preparing \u201c" + seg.label + "\u201d", 12);
     const data = await ff.readFile(outName);
     seg.normBlob = new Blob([data.buffer], { type: "video/mp4" });
     seg.normSpec = normSpec();
@@ -3739,6 +3840,8 @@ function revLen() {
 }
 $("btnRetrim").onclick = async () => {
   const a = +$("revIn").value, b = +$("revOut").value;
+  if (!isFinite(a) || !isFinite(b) || b - a < 0.3 || b - a > 7200)
+    return toast("Those trim handles don't look right \u2014 reset them and try again.", true);
   if (a <= 0.01 && b >= (S.finalDur || 0) - 0.01) return toast("Nothing trimmed \u2014 move a handle first.");
   $("btnRetrim").disabled = true;
   plog("Re-rendering " + fmtDur(b - a) + "\u2026");
