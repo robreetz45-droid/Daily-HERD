@@ -3232,11 +3232,20 @@ async function fetchProgress(url, label) {
   return out;
 }
 
+function threadCount() {
+  try {
+    if (!self.crossOriginIsolated) return 0;        // no coi.js, no shared memory
+    const n = navigator.hardwareConcurrency || 4;
+    return Math.max(2, Math.min(8, n - 1));         // leave a core for the browser
+  } catch (e) { return 0; }
+}
+
 async function ffLoad() {
   if (FF) return FF;
   if (ffLoading) return ffLoading;
   ffLoading = (async () => {
     let base = FF_LOCAL, coreBase = FF_LOCAL;
+    const threads = threadCount();
     plog("Starting the video engine\u2026");
     try {
       await loadScript(base + "ffmpeg.js");
