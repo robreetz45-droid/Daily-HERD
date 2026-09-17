@@ -3492,7 +3492,7 @@ function normSpec() { return canW() + "x" + canH() + "@" + OPEN_FPS; }
    a video encoder running beside a live capture starves the capture, and the
    recording itself comes out stuttering. All the encoding happens at the end. */
 function queueNormalise(seg) {
-  if (!seg || seg.normBlob || NORM.queue.indexOf(seg) > -1) return;
+  if (!seg || segReady(seg) || NORM.queue.indexOf(seg) > -1) return;
   NORM.queue.push(seg);
 }
 /* MediaRecorder files often carry no duration in the header, so seek past the end
@@ -3567,6 +3567,11 @@ async function runNormalise() {
          The overlay is a still image, so this is one composite per frame with
          no chance of a dropped or duplicated frame anywhere in it. */
       const look = seg.look || S.look || "window";
+      /* the span being kept after any trim — trimming happens here now, so a
+         trimmed clip is composited exactly like an untrimmed one */
+      const tIn = Math.max(0, +seg.trimIn || 0);
+      const tOut = (seg.trimOut != null && isFinite(seg.trimOut)) ? +seg.trimOut : realDur;
+      const useDur = Math.max(0.5, Math.min(tOut - tIn, realDur));
       const R = camRect(look);
       const png = "ov_" + seg.id + ".png";
       await blobToFF(ff, png, await overlayPNG(seg.shownKey || S.shownKey, look, seg.bgKey));
@@ -3578,21 +3583,25 @@ async function runNormalise() {
         "color=c=black:s=" + W + "x" + H + ":r=" + FPS + "[bgc];" +
         "[bgc][cam]overlay=" + R.x + ":" + R.y + ":shortest=1[u];" +
         "[u][1:v]overlay=0:0:format=auto:shortest=1,format=yuv420p[vv]";
-      if (fade > 0.01 && realDur > fade * 2.5) {
-        const outAt = (realDur - fade).toFixed(3);
+      if (fade > 0.01 && useDur > fade * 2.5) {
+        const outAt = (useDur - fade).toFixed(3);
         chain += ";[vv]fade=t=in:st=0:d=" + fade + ",fade=t=out:st=" + outAt + ":d=" + fade + "[v]";
       } else chain += ";[vv]null[v]";
 
-      const a2 = ["-i", inName, "-loop", "1", "-i", png];
+      const a2 = [];
+      if (tIn > 0.05) a2.push("-ss", tIn.toFixed(3));
+      a2.push("-i", inName, "-loop", "1", "-i", png);
       if (S.ffThreads) a2.push("-threads", String(S.ffThreads));
       a2.push("-filter_complex", chain, "-map", "[v]", "-map", "0:a?", "-af", af,
-        ...encFlags(), "-t", realDur.toFixed(3),
+        ...encFlags(), "-t", useDur.toFixed(3),
         "-avoid_negative_ts", "make_zero", "-y", outName);
       await runStep(ff, a2, "compositing \u201c" + seg.label + "\u201d", 12);
       ff.deleteFile(png).catch(() => {});
       const data0 = await ff.readFile(outName);
       seg.normBlob = new Blob([data0.buffer], { type: "video/mp4" });
       seg.normSpec = normSpec();
+      seg.normKey = segKey(seg);
+      seg.outDur = useDur;
       ff.deleteFile(inName).catch(() => {});
       ff.deleteFile(outName).catch(() => {});
       renderSegs();
@@ -3623,10 +3632,23 @@ async function runNormalise() {
   }
   NORM.busy = false;
 }
-function segReady(seg) {
-  return !!seg.normBlob && seg.normSpec === normSpec() &&
-         seg.trimIn < 0.05 && seg.trimOut > seg.dur - 0.05;
+/* Everything that changes how a prepared clip looks. If any of it moves, the clip
+   has to be built again. Trimming used to disqualify a clip from being composited
+   at all, which sent it down a raw path with no graphics — and one raw clip dragged
+   the whole show onto a fallback join that composites nothing. */
+function segKey(seg) {
+  const idx = itemIdxFor(seg.shownKey);
+  const it = (idx != null && S.items[idx]) ? S.items[idx] : null;
+  const st = it ? strapFor(it) : { title: "", sub: "" };
+  const a = adjOf(it);
+  return [normSpec(), seg.look || S.look, seg.bgKey || S.bgKey, seg.shownKey,
+          (+seg.trimIn || 0).toFixed(2), (+seg.trimOut || 0).toFixed(2),
+          it && it.image ? it.image.length : -1,
+          st.title, st.sub, a.fit, a.y, a.z,
+          $("gImg").checked ? 1 : 0, $("gLower").checked ? 1 : 0,
+          $("gBug").checked ? 1 : 0, fadeSecs(), today()].join("~");
 }
+function segReady(seg) { return !!seg.normBlob && seg.normKey === segKey(seg); }
 function normProgress() {
   if (!S.segs.length) return "";
   const done = S.segs.filter(segReady).length;
@@ -3708,34 +3730,21 @@ async function assembleFF() {
 
   for (let i = 0; i < S.segs.length; i++) {
     const tk = S.segs[i];
-    if (segReady(tk)) {
-      /* already composited and encoded to the shared spec — use it as is */
-      const pre = "p" + i + ".mp4";
-      plog("Segment " + (i + 1) + "/" + S.segs.length + " \u00b7 " + tk.label + " (prepared)");
-      await blobToFF(ff, pre, tk.normBlob);
-      list.push({ name: pre, dur: tk.realDur || tk.dur, pre: true });
-      tk.cues.forEach(q => cues.push({ t: q.t + offset, text: q.text, itemIdx: q.itemIdx }));
-      offset += tk.realDur || tk.dur;
-      continue;
+    if (!segReady(tk)) {
+      /* Falling through here used to join the raw camera file, which carries no
+         backdrop, no picture and no banner — the whole reason the graphics kept
+         disappearing. Stop instead and say so. */
+      throw new Error("\u201c" + tk.label + "\u201d could not be prepared, so the graphics " +
+        "would be missing. Press Assemble show again; if it keeps failing, delete that " +
+        "segment and re-record it.");
     }
-    const trimmed = tk.trimIn > 0.05 || tk.trimOut < tk.dur - 0.05;
-    const raw = "r" + i + "." + ext, cut = "c" + i + "." + ext;
-    plog("Segment " + (i + 1) + "/" + S.segs.length + " \u00b7 " + tk.label + (trimmed ? " (trimming)" : ""));
-    await blobToFF(ff, raw, tk.blob);
-    if (trimmed) {
-      /* a trim has to land between keyframes, so this one clip gets re-encoded.
-         Untrimmed clips are copied through untouched. */
-      const tA = ["-ss", String(tk.trimIn), "-to", String(tk.trimOut), "-i", raw,
-        "-vf", "scale=" + canW() + ":" + canH() +
-               ":force_original_aspect_ratio=decrease,pad=" + canW() + ":" + canH() +
-               ":-1:-1:color=black,setsar=1,format=yuv420p,fps=" + OPEN_FPS];
-      if (S.ffThreads) tA.push("-threads", String(S.ffThreads));
-      await ff.exec(tA.concat(encFlags(), ["-y", cut]));
-      list.push({ name: cut, dur: tk.trimOut - tk.trimIn });
-    } else list.push({ name: raw, dur: tk.dur });
-    tk.cues.forEach(q => { if (q.t >= tk.trimIn && q.t <= tk.trimOut)
-      cues.push({ t: q.t - tk.trimIn + offset, text: q.text, itemIdx: q.itemIdx }); });
-    offset += tk.trimOut - tk.trimIn;
+    const pre = "p" + i + ".mp4";
+    plog("Segment " + (i + 1) + "/" + S.segs.length + " \u00b7 " + tk.label + " (prepared)");
+    await blobToFF(ff, pre, tk.normBlob);
+    list.push({ name: pre, dur: tk.outDur || tk.dur, pre: true });
+    tk.cues.forEach(q => { if (q.t >= (tk.trimIn || 0) && q.t <= (tk.trimOut != null ? tk.trimOut : 1e9))
+      cues.push({ t: q.t - (tk.trimIn || 0) + offset, text: q.text, itemIdx: q.itemIdx }); });
+    offset += tk.outDur || tk.dur;
   }
 
   if (cD) {
