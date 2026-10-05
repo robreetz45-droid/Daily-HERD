@@ -668,6 +668,7 @@ function fileExt() {
   return f ? f[2] : "webm";
 }
 
+const ovCache = new Map();      // rendered overlays, keyed by what they depend on
 const HAS_GAS = (typeof google !== "undefined" && google.script && google.script.run);
 const OUT_W = 1280, OUT_H = 720;          // design space — all layout is in these units
 const RES = { "720": 1, "1080": 1.5 };
@@ -1437,7 +1438,13 @@ function setMode(m) {
 }
 document.querySelectorAll("#segMode button").forEach(b => b.onclick = () => setMode(b.dataset.m));
 function setLook(l) {
+  const changed = S.look !== l;
   S.look = l;
+  if (changed) {
+    /* every prepared clip was built for the old look, so it has to go */
+    S.segs.forEach(g => { g.normBlob = null; g.normKey = null; });
+    ovCache.clear();
+  }
   document.querySelectorAll("#segLook button").forEach(b => b.setAttribute("aria-pressed", b.dataset.l === l));
   $("matteBox").style.display = (l === "window") ? "none" : "";
 }
@@ -1445,6 +1452,10 @@ document.querySelectorAll("#segLook button").forEach(b => b.onclick = () => setL
 $("smo").oninput = () => $("smoV").textContent = $("smo").value;
 $("wrap").oninput = () => $("wrapV").textContent = $("wrap").value;
 document.querySelectorAll("#segBg button").forEach(b => b.onclick = () => {
+  if (S.bgKey !== b.dataset.b) {
+    S.segs.forEach(g => { g.normBlob = null; g.normKey = null; });
+    ovCache.clear();
+  }
   S.bgKey = b.dataset.b;
   document.querySelectorAll("#segBg button").forEach(x => x.setAttribute("aria-pressed", x === b));
 });
@@ -1756,6 +1767,14 @@ function drawBug(x) {
   try { x.letterSpacing = "0px"; } catch (e) {}
 }
 
+function paintBackdrop(x, key) {
+  x.fillStyle = "#062A1A";
+  x.fillRect(0, 0, OUT_W, OUT_H);
+  const bg = bgImgs[key];
+  if (bg && bg.complete && bg.naturalWidth) {
+    try { x.drawImage(bg, 0, 0, OUT_W, OUT_H); } catch (e) {}
+  }
+}
 function drawHero(x, item) {
   const R = HERO;
   let im = $("gImg").checked ? storyImg(item) : null;
@@ -1824,9 +1843,11 @@ function drawTitleCard(x, R) {
 function drawFrame(ts) {
   const x = pctx;
   sizeStage(); stage(x);
-  const bg = bgImgs[S.bgKey];
-  if (bg && bg.complete) x.drawImage(bg, 0, 0, OUT_W, OUT_H);
-  else { x.fillStyle = "#062A1A"; x.fillRect(0, 0, OUT_W, OUT_H); }
+  /* Always lay down the solid colour first, then the backdrop picture over it.
+     A backdrop that is missing, still decoding, or transparent then costs us a
+     photograph — not the whole frame. Painting it only as an "else" once left the
+     canvas bare, and a bare canvas means the camera fills the screen. */
+  paintBackdrop(x, S.bgKey);
   /* the last story we actually saw, so its picture stays up through the anchor
      lines that follow it rather than blinking out */
   /* The segment picker decides what is on screen. It does not change while you
@@ -1886,8 +1907,7 @@ function drawFrame(ts) {
         wrapX.clearRect(0, 0, wrapC.width, wrapC.height);
         stage(wrapX);
         wrapX.filter = "blur(26px)";
-        if (bg && bg.complete) wrapX.drawImage(bg, 0, 0, OUT_W, OUT_H);
-        else { wrapX.fillStyle = "#062A1A"; wrapX.fillRect(0, 0, OUT_W, OUT_H); }
+        paintBackdrop(wrapX, S.bgKey);
         wrapX.filter = "none";
         wrapX.globalCompositeOperation = "destination-in";
         wrapX.save();
@@ -2324,13 +2344,12 @@ function armedPicture() {
 /* The take on disk is bare camera — the graphics are added at assembly. So the
    preview places the video exactly where the window sits and lays the real
    overlay on top, which is what the finished show will look like. */
-const ovCache = new Map();
 function dressPreview(card, seg) {
   const stage = card.querySelector(".sc-stage");
   const vid = card.querySelector("video");
   const img = card.querySelector(".sc-ov");
   if (!stage || !vid) return;
-  const look = seg.look || S.look || "window";
+  const look = S.look || "window";
   if (look === "window") {
     vid.style.left   = (WIN.x / OUT_W * 100) + "%";
     vid.style.top    = (WIN.y / OUT_H * 100) + "%";
@@ -2342,11 +2361,11 @@ function dressPreview(card, seg) {
     vid.style.width = "100%"; vid.style.height = "100%";
     vid.style.borderRadius = "0";
   }
-  const key = [seg.id, seg.shownKey, look, seg.bgKey || S.bgKey,
+  const key = [seg.id, seg.shownKey, look, S.bgKey,
                S.items.map(it => (it.slug || "") + (it.image ? 1 : 0) +
                  (it.strapTitle || "") + (it.strapSub || "")).join("|")].join("~");
   if (ovCache.has(key)) { img.src = ovCache.get(key); return; }
-  overlayPNG(seg.shownKey, look, seg.bgKey).then(blob => {
+  overlayPNG(seg.shownKey, look, S.bgKey).then(blob => {
     if (!blob) return;
     const url = URL.createObjectURL(blob);
     ovCache.set(key, url);
@@ -3600,13 +3619,16 @@ async function prepareSegment(seg) {
   }
 
   async function composite(src) {
-    const look = seg.look || S.look || "window";
+    const look = S.look || "window";        // the control, not whatever was set when it recorded
     const tIn = Math.max(0, +seg.trimIn || 0);
     const tOut = (seg.trimOut != null && isFinite(seg.trimOut)) ? +seg.trimOut : realDur;
     const useDur = Math.max(0.5, Math.min(tOut - tIn, realDur));
     const R = camRect(look);
     const png = "ov_" + seg.id + ".png";
-    await blobToFF(ff, png, await overlayPNG(seg.shownKey || S.shownKey, look, seg.bgKey));
+    /* slot 0 is a real key, so test for absence rather than falsiness —
+       `||` sent the first story of every show to the wrong item and lost its strap */
+    const shown = (seg.shownKey == null) ? S.shownKey : seg.shownKey;
+    await blobToFF(ff, png, await overlayPNG(shown, look, S.bgKey));
     cleanup.push(png);
 
     let aChain = af;
@@ -3683,7 +3705,7 @@ function segKey(seg) {
   const it = (idx != null && S.items[idx]) ? S.items[idx] : null;
   const st = it ? strapFor(it) : { title: "", sub: "" };
   const a = adjOf(it);
-  return [normSpec(), seg.look || S.look, seg.bgKey || S.bgKey, seg.shownKey,
+  return [normSpec(), S.look, S.bgKey, seg.shownKey,
           (+seg.trimIn || 0).toFixed(2), (+seg.trimOut || 0).toFixed(2),
           it && it.image ? it.image.length : -1,
           st.title, st.sub, a.fit, a.y, a.z,
@@ -3702,46 +3724,72 @@ function camRect(look) {
   const r = resFactor();
   const R = ((look || S.look) === "window") ? WIN : { x: 0, y: 0, w: OUT_W, h: OUT_H };
   return { x: Math.round(R.x * r), y: Math.round(R.y * r),
-           w: Math.round(R.w * r), h: Math.round(R.h * r), rounded: S.look === "window" };
+           w: Math.round(R.w * r), h: Math.round(R.h * r), rounded: (look || S.look) === "window" };
 }
 
 /* One PNG holding the backdrop, the story picture, the banner and the bug,
    with the camera window punched out so the video shows through. */
-function overlayPNG(shownKey, look, bgKey) {
+/* Wait for a story picture to finish decoding. storyImg() returns null until then,
+   which used to make the assembled show quietly fall back to the title card — the
+   submitted photo "disappeared" even though it was right there in the rundown. */
+function decoded(im) {
+  if (!im) return Promise.resolve();
+  if (im.complete && im.naturalWidth) return Promise.resolve();
+  return new Promise(res => {
+    let done = false;
+    const fin = () => { if (!done) { done = true; res(); } };
+    im.addEventListener("load", fin, { once: true });
+    im.addEventListener("error", fin, { once: true });
+    setTimeout(fin, 8000);                      // never hang the assembly on one picture
+  });
+}
+function readyImg(item) {
+  if (!item || !item.image) return Promise.resolve();
+  primeImg(item);
+  return decoded(item._img);
+}
+async function overlayPNG(shownKey, look, bgKey) {
   look = look || S.look || "window";
+  {
+    const i0 = itemIdxFor(shownKey);
+    if (i0 != null && S.items[i0]) await readyImg(S.items[i0]);
+    await decoded(bgImgs[bgKey || S.bgKey]);
+    await decoded(bugImg); await decoded(openLogo);
+  }
   const c = document.createElement("canvas");
   c.width = canW(); c.height = canH();
   const x = c.getContext("2d");
   stage(x);
 
-  const bg = bgImgs[bgKey || S.bgKey];
-  if (bg && bg.complete) x.drawImage(bg, 0, 0, OUT_W, OUT_H);
-  else { x.fillStyle = "#062A1A"; x.fillRect(0, 0, OUT_W, OUT_H); }
-
   const idx = itemIdxFor(shownKey);
   const item = (idx != null && S.items[idx]) ? S.items[idx] : null;
-  drawHero(x, item);
 
   if (look === "window") {
+    paintBackdrop(x, bgKey || S.bgKey);
+    drawHero(x, item);
+
     const R = WIN;
     x.save(); x.shadowColor = "rgba(0,0,0,.55)"; x.shadowBlur = 40; x.shadowOffsetY = 16;
     roundRect(x, R.x, R.y, R.w, R.h, 18); x.fillStyle = "#0B1A13"; x.fill(); x.restore();
     x.strokeStyle = SHINE; x.lineWidth = 3;
     roundRect(x, R.x + 3, R.y + 3, R.w - 6, R.h - 6, 16); x.stroke();
+
+    drawLower(x, item);
+
+    /* cut the camera window out so the video shows through it */
+    x.save();
+    x.globalCompositeOperation = "destination-out";
+    roundRect(x, R.x + 5, R.y + 5, R.w - 10, R.h - 10, 13);
+    x.fillStyle = "#000"; x.fill();
+    x.restore();
+  } else {
+    /* The camera fills the picture, so there is no backdrop to draw and nowhere
+       to put the story panel — but the banner and the mark still belong on top,
+       exactly as a broadcast lower third sits over full-screen video. */
+    drawLower(x, item);
   }
 
-  drawLower(x, item);
-
-  /* cut the camera window out of the overlay */
-  x.save();
-  x.globalCompositeOperation = "destination-out";
-  if (look === "window") roundRect(x, WIN.x + 5, WIN.y + 5, WIN.w - 10, WIN.h - 10, 13);
-  else { x.beginPath(); x.rect(0, 0, OUT_W, OUT_H); }
-  x.fillStyle = "#000"; x.fill();
-  x.restore();
-
-  /* the mark goes on after the cut, so it can never be clipped by it */
-  drawBug(x);
+  drawBug(x);                 // always last, so nothing can clip it
 
   return new Promise(res => c.toBlob(res, "image/png"));
 }
