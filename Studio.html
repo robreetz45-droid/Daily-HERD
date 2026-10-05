@@ -1739,10 +1739,21 @@ function drawLower(x, item) {
 }
 function drawBug(x) {
   if (!$("gBug").checked) return;
-  if (bugImg.complete) x.drawImage(bugImg, OUT_W - 190, 34, 132, bugImg.height * 132 / bugImg.width);
-  x.fillStyle = "rgba(255,255,255,.85)"; x.font = "600 15px Inter, sans-serif"; x.textAlign = "right";
-  x.fillText(today().toUpperCase(), OUT_W - 58, 130);
+  const right = WIN.x + WIN.w;            // same edge as the frames below
+  const h = 48, y = 14;
+  let w = 0;
+  if (bugImg.complete && bugImg.naturalWidth) {
+    w = Math.round(h * bugImg.naturalWidth / bugImg.naturalHeight);
+    x.drawImage(bugImg, right - w, y, w, h);
+  }
+  x.save();
+  setType(x, 600, 18, "Inter,system-ui,sans-serif", 2);
+  x.fillStyle = "rgba(255,255,255,.82)";
+  x.textAlign = "right";
+  x.fillText(today().toUpperCase(), right - w - 20, y + h - 14);
   x.textAlign = "left";
+  x.restore();
+  try { x.letterSpacing = "0px"; } catch (e) {}
 }
 
 function drawHero(x, item) {
@@ -3720,15 +3731,17 @@ function overlayPNG(shownKey, look, bgKey) {
   }
 
   drawLower(x, item);
-  drawBug(x);
 
-  /* punch the hole last, so the border and bug survive above the video */
+  /* cut the camera window out of the overlay */
   x.save();
   x.globalCompositeOperation = "destination-out";
   if (look === "window") roundRect(x, WIN.x + 5, WIN.y + 5, WIN.w - 10, WIN.h - 10, 13);
   else { x.beginPath(); x.rect(0, 0, OUT_W, OUT_H); }
   x.fillStyle = "#000"; x.fill();
   x.restore();
+
+  /* the mark goes on after the cut, so it can never be clipped by it */
+  drawBug(x);
 
   return new Promise(res => c.toBlob(res, "image/png"));
 }
