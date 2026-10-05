@@ -2144,7 +2144,6 @@ function startCountdown() {
   if (!S.stream) return toast("Start the camera first.", true);
   if (!pv.captureStream) return toast("This browser can't record a canvas. Use Chrome or Edge.", true);
   if (!S.armed) armSlot(null);
-  NORM.waiting = NORM.waiting || NORM.queue.length > 0;
   S.cdCancel = false; S.cd = 3; S.cdT0 = performance.now();
   setTransport("count"); if ($("cdBeep").checked) beep(620, 0.11, 0.20);
   (function tick() {
@@ -2235,8 +2234,10 @@ function onRecStop() {
   });
   S.armed = null;
   setTransport("none");
-  queueNormalise(S.segs[S.segs.length - 1]);
   renderSegs(); renderRundown();
+  if (blob.size < 50000)
+    toast("That take came out at only " + Math.round(blob.size / 1024) + " KB \u2014 it did not " +
+      "record properly. Delete it and try again.", true);
   const quiet = S.recPeak < 0.02;
   toast("Segment saved — " + fmtDur(dur) + (quiet ? ". No audio was detected — check the mic before recording more." : "."), quiet);
 }
@@ -3341,7 +3342,20 @@ async function ffLoad() {
 }
 
 async function blobToFF(ff, name, blob) {
-  await ff.writeFile(name, new Uint8Array(await blob.arrayBuffer()));
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  if (!bytes.length) throw new Error("that recording is empty (0 bytes)");
+  await ff.writeFile(name, bytes);
+  return bytes.length;
+}
+
+/* The container a blob really is, rather than whatever the codec menu says now.
+   A take recorded earlier may not match the current setting. */
+function extForBlob(blob) {
+  const t = (blob && blob.type || "").toLowerCase();
+  if (t.indexOf("matroska") > -1) return "mkv";
+  if (t.indexOf("mp4") > -1) return "mp4";
+  if (t.indexOf("webm") > -1) return "webm";
+  return fileExt();
 }
 
 /* ------------------------------------------------------------------
@@ -3457,7 +3471,7 @@ async function renderSequenceFF(ff, painter, D, withSound, tag) {
   return out;
 }
 
-const NORM = { queue: [], busy: false };
+
 let stepT0 = 0;
 function step(msg) { stepT0 = Date.now(); plog(msg); }
 function stepDone(extra) {
@@ -3474,7 +3488,11 @@ async function runStep(ff, args, label, limitMin) {
     if (!done) no(new Error(label + " took longer than " + (limitMin || 10) +
       " minutes and was stopped. Try 720p in Camera, mic & quality, or fewer segments."));
   }, limit));
-  try { await Promise.race([ff.exec(args), guard]); } finally { done = true; }
+  let code;
+  try { code = await Promise.race([ff.exec(args), guard]); } finally { done = true; }
+  if (typeof code === "number" && code !== 0)
+    throw new Error(label + " failed (ffmpeg exit " + code + ")");
+  return code;
 }
 
 function encFlags() {
@@ -3491,10 +3509,7 @@ function normSpec() { return canW() + "x" + canH() + "@" + OPEN_FPS; }
 /* Used only by the assembly stage. Nothing calls this while the camera is on:
    a video encoder running beside a live capture starves the capture, and the
    recording itself comes out stuttering. All the encoding happens at the end. */
-function queueNormalise(seg) {
-  if (!seg || segReady(seg) || NORM.queue.indexOf(seg) > -1) return;
-  NORM.queue.push(seg);
-}
+
 /* MediaRecorder files often carry no duration in the header, so seek past the end
    and read where it lands. The fade-out is timed against this. */
 /* stopwatch is what the studio timed while recording; probed is what the browser
@@ -3535,103 +3550,119 @@ function blobDuration(blob) {
   });
 }
 
-async function runNormalise() {
-  if (NORM.busy || !NORM.queue.length) return;
-  NORM.busy = true;
-  const seg = NORM.queue.shift();
-  try {
-    const ff = await ffLoad();
-    const inName = "n_in_" + seg.id + "." + fileExt();
-    const outName = "n_out_" + seg.id + ".mp4";
-    await blobToFF(ff, inName, seg.blob);
-    const W = canW(), H = canH();
-    const a = ["-i", inName];
-    if (S.ffThreads) a.push("-threads", String(S.ffThreads));
-    const probed = await blobDuration(seg.blob);
-    const realDur = sensibleDuration(probed, seg.dur, seg.label);
-    const fade = Math.min(fadeSecs(), Math.max(0, realDur / 3));
-    seg.realDur = realDur;
-    const FPS = OPEN_FPS;
+/* Prepare one segment: composite the graphics onto the clean camera recording and
+   encode it to the shared spec. Takes the segment directly rather than pulling from
+   a queue, so the order can never drift from the order on screen. */
+async function prepareSegment(seg) {
+  const ff = await ffLoad();
+  const inName = "n_in_" + seg.id + "." + extForBlob(seg.blob);
+  const outName = "n_out_" + seg.id + ".mp4";
+  const cleanup = [];
 
-    /* apad with -shortest makes the audio end exactly where the picture does.
-       Without it every clip's sound overhangs slightly, and across a show those
-       add up until the audio is running ahead of the mouths. */
-    let af = "aresample=48000:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,apad";
-    if (fade > 0.01 && realDur > fade * 2.5) {
-      const outAt = (realDur - fade).toFixed(3);
-      af += ",afade=t=in:st=0:d=" + fade + ",afade=t=out:st=" + outAt + ":d=" + fade;
-    }
+  const inBytes = await blobToFF(ff, inName, seg.blob);
+  cleanup.push(inName);
+  plog("   " + (inBytes / 1048576).toFixed(1) + " MB · " + (seg.blob.type || "unknown type"));
+  if (inBytes < 50000)
+    throw new Error("“" + seg.label + "” is only " + inBytes + " bytes, so it did not " +
+      "record properly. Delete that segment and record it again.");
 
-    if (seg.direct) {
-      /* ---- the camera was recorded clean; the graphics go on now ----
-         The overlay is a still image, so this is one composite per frame with
-         no chance of a dropped or duplicated frame anywhere in it. */
-      const look = seg.look || S.look || "window";
-      /* the span being kept after any trim — trimming happens here now, so a
-         trimmed clip is composited exactly like an untrimmed one */
-      const tIn = Math.max(0, +seg.trimIn || 0);
-      const tOut = (seg.trimOut != null && isFinite(seg.trimOut)) ? +seg.trimOut : realDur;
-      const useDur = Math.max(0.5, Math.min(tOut - tIn, realDur));
-      const R = camRect(look);
-      const png = "ov_" + seg.id + ".png";
-      await blobToFF(ff, png, await overlayPNG(seg.shownKey || S.shownKey, look, seg.bgKey));
+  const W = canW(), H = canH(), FPS = OPEN_FPS;
+  const probed = await blobDuration(seg.blob);
+  const realDur = sensibleDuration(probed, seg.dur, seg.label);
+  seg.realDur = realDur;
+  const fade = Math.min(fadeSecs(), Math.max(0, realDur / 3));
 
-      let chain =
-        "[0:v]" + (S.mirror === false ? "" : "hflip,") +
-        "scale=" + R.w + ":" + R.h + ":force_original_aspect_ratio=increase," +
-        "crop=" + R.w + ":" + R.h + ",setsar=1,fps=" + FPS + "[cam];" +
-        "color=c=black:s=" + W + "x" + H + ":r=" + FPS + "[bgc];" +
-        "[bgc][cam]overlay=" + R.x + ":" + R.y + ":shortest=1[u];" +
-        "[u][1:v]overlay=0:0:format=auto:shortest=1,format=yuv420p[vv]";
-      if (fade > 0.01 && useDur > fade * 2.5) {
-        const outAt = (useDur - fade).toFixed(3);
-        chain += ";[vv]fade=t=in:st=0:d=" + fade + ",fade=t=out:st=" + outAt + ":d=" + fade + "[v]";
-      } else chain += ";[vv]null[v]";
+  /* apad with an explicit duration makes the audio end exactly where the picture
+     does. Without it every clip's sound overhangs slightly, and across a show those
+     add up until the audio is running ahead of the mouths. */
+  let af = "aresample=48000:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,apad";
 
-      const a2 = [];
-      if (tIn > 0.05) a2.push("-ss", tIn.toFixed(3));
-      a2.push("-i", inName, "-loop", "1", "-i", png);
-      if (S.ffThreads) a2.push("-threads", String(S.ffThreads));
-      a2.push("-filter_complex", chain, "-map", "[v]", "-map", "0:a?", "-af", af,
-        ...encFlags(), "-t", useDur.toFixed(3),
-        "-avoid_negative_ts", "make_zero", "-y", outName);
-      await runStep(ff, a2, "compositing \u201c" + seg.label + "\u201d", 12);
-      ff.deleteFile(png).catch(() => {});
-      const data0 = await ff.readFile(outName);
-      seg.normBlob = new Blob([data0.buffer], { type: "video/mp4" });
-      seg.normSpec = normSpec();
-      seg.normKey = segKey(seg);
-      seg.outDur = useDur;
-      ff.deleteFile(inName).catch(() => {});
-      ff.deleteFile(outName).catch(() => {});
-      renderSegs();
-      NORM.busy = false;
-      return;
-    }
-
-    let vf = "scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease," +
-             "pad=" + W + ":" + H + ":-1:-1:color=black,setsar=1,fps=" + FPS;
-    if (fade > 0.01 && realDur > fade * 2.5) {
-      const outAt = (realDur - fade).toFixed(3);
-      vf += ",fade=t=in:st=0:d=" + fade + ",fade=t=out:st=" + outAt + ":d=" + fade;
-    }
-    a.push("-vf", vf, "-af", af,
-           ...encFlags(), "-t", realDur.toFixed(3),
-           "-avoid_negative_ts", "make_zero", "-y", outName);
-    await runStep(ff, a, "preparing \u201c" + seg.label + "\u201d", 12);
-    const data = await ff.readFile(outName);
-    seg.normBlob = new Blob([data.buffer], { type: "video/mp4" });
-    seg.normSpec = normSpec();
-    ff.deleteFile(inName).catch(() => {});
-    ff.deleteFile(outName).catch(() => {});
-    renderSegs();
-  } catch (e) {
-    seg.normFailed = true;
-    plog("  (preparing \u201c" + seg.label + "\u201d failed: " + (e && e.message || e) + ")");
-    console.error("normalise:", e);
+  /* Some recordings come out of the browser with timestamps ffmpeg will not accept
+     on the first pass. Rewriting the container costs a second and fixes them. */
+  async function repair(src) {
+    const fixed = "n_fix_" + seg.id + ".mkv";
+    plog("   repairing the recording…");
+    await runStep(ff, ["-fflags", "+genpts", "-i", src, "-c", "copy", "-y", fixed],
+      "repairing “" + seg.label + "”", 6);
+    cleanup.push(fixed);
+    return fixed;
   }
-  NORM.busy = false;
+
+  async function composite(src) {
+    const look = seg.look || S.look || "window";
+    const tIn = Math.max(0, +seg.trimIn || 0);
+    const tOut = (seg.trimOut != null && isFinite(seg.trimOut)) ? +seg.trimOut : realDur;
+    const useDur = Math.max(0.5, Math.min(tOut - tIn, realDur));
+    const R = camRect(look);
+    const png = "ov_" + seg.id + ".png";
+    await blobToFF(ff, png, await overlayPNG(seg.shownKey || S.shownKey, look, seg.bgKey));
+    cleanup.push(png);
+
+    let aChain = af;
+    let chain =
+      "[0:v]" + (S.mirror === false ? "" : "hflip,") +
+      "scale=" + R.w + ":" + R.h + ":force_original_aspect_ratio=increase," +
+      "crop=" + R.w + ":" + R.h + ",setsar=1,fps=" + FPS + "[cam];" +
+      "color=c=black:s=" + W + "x" + H + ":r=" + FPS + "[bgc];" +
+      "[bgc][cam]overlay=" + R.x + ":" + R.y + ":shortest=1[u];" +
+      "[u][1:v]overlay=0:0:format=auto:shortest=1,format=yuv420p[vv]";
+    if (fade > 0.01 && useDur > fade * 2.5) {
+      const outAt = (useDur - fade).toFixed(3);
+      chain += ";[vv]fade=t=in:st=0:d=" + fade + ",fade=t=out:st=" + outAt + ":d=" + fade + "[v]";
+      aChain += ",afade=t=in:st=0:d=" + fade + ",afade=t=out:st=" + outAt + ":d=" + fade;
+    } else chain += ";[vv]null[v]";
+
+    const a = [];
+    if (tIn > 0.05) a.push("-ss", tIn.toFixed(3));
+    a.push("-i", src, "-loop", "1", "-i", png);
+    if (S.ffThreads) a.push("-threads", String(S.ffThreads));
+    a.push("-filter_complex", chain, "-map", "[v]", "-map", "0:a?", "-af", aChain,
+      ...encFlags(), "-t", useDur.toFixed(3),
+      "-avoid_negative_ts", "make_zero", "-y", outName);
+    await runStep(ff, a, "compositing “" + seg.label + "”", 12);
+    return useDur;
+  }
+
+  async function plainEncode(src) {
+    const useDur = realDur;
+    let vf = "scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease," +
+             "pad=" + W + ":" + H + ":-1:-1:color=black,setsar=1,format=yuv420p,fps=" + FPS;
+    let aChain = af;
+    if (fade > 0.01 && useDur > fade * 2.5) {
+      const outAt = (useDur - fade).toFixed(3);
+      vf += ",fade=t=in:st=0:d=" + fade + ",fade=t=out:st=" + outAt + ":d=" + fade;
+      aChain += ",afade=t=in:st=0:d=" + fade + ",afade=t=out:st=" + outAt + ":d=" + fade;
+    }
+    const a = ["-i", src];
+    if (S.ffThreads) a.push("-threads", String(S.ffThreads));
+    a.push("-vf", vf, "-af", aChain, ...encFlags(), "-t", useDur.toFixed(3),
+      "-avoid_negative_ts", "make_zero", "-y", outName);
+    await runStep(ff, a, "preparing “" + seg.label + "”", 12);
+    return useDur;
+  }
+
+  const build = seg.direct ? composite : plainEncode;
+  let useDur;
+  try {
+    useDur = await build(inName);
+  } catch (first) {
+    plog("   (first attempt failed: " + (first && first.message || first) + ")");
+    useDur = await build(await repair(inName));      // one repair, then give up honestly
+  }
+
+  const data = await ff.readFile(outName);
+  if (!data || data.length < 10000)
+    throw new Error("“" + seg.label + "” produced no usable video.");
+  seg.normBlob = new Blob([data.buffer], { type: "video/mp4" });
+  seg.normSpec = normSpec();
+  seg.normKey = segKey(seg);
+  seg.outDur = useDur;
+  seg.normFailed = false;
+  cleanup.push(outName);
+  cleanup.forEach(f => ff.deleteFile(f).catch(() => {}));
+  renderSegs();
 }
+
 /* Everything that changes how a prepared clip looks. If any of it moves, the clip
    has to be built again. Trimming used to disqualify a clip from being composited
    at all, which sent it down a raw path with no graphics — and one raw clip dragged
@@ -3712,8 +3743,7 @@ async function assembleFF() {
     if (segReady(tk)) continue;
     plog("Preparing " + (i + 1) + "/" + S.segs.length + " \u00b7 " + tk.label + "\u2026");
     pbar((i + 0.5) / (S.segs.length + 2));
-    queueNormalise(tk);
-    await runNormalise();
+    await prepareSegment(tk);
     if (cancelAssembly) throw new Error("stopped");
   }
 
