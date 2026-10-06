@@ -2260,7 +2260,7 @@ function onRecStop() {
   S.segs.push({
     id: "s" + Date.now(), key: key, blob, url: URL.createObjectURL(blob), dur,
     direct: S.recDirect, shownKey: S.shownKey, look: S.look, bgKey: S.bgKey,
-    cues: S.recCues.slice(), trimIn: 0, trimOut: dur,
+    cues: S.recCues.slice(),
     label: slotLabel(key), org: slotOrg(key)
   });
   S.armed = null;
@@ -2381,29 +2381,20 @@ function renderSegs() {
     const d = el("div", "segcard");
     d.innerHTML =
       '<div class="sc-h"><span class="sc-n">' + String(i + 1).padStart(2, "0") + '</span>' +
-      '<b>' + esc(g.label) + '</b><span class="sc-d">' + fmtDur(g.trimOut - g.trimIn) + '</span>' +
+      '<b>' + esc(g.label) + '</b><span class="sc-d">' + fmtDur(g.dur) + '</span>' +
       (g.org ? '<span class="sc-org">' + esc(g.org) + '</span>' : '') + '</div>' +
       '<div class="sc-stage" data-stage="' + i + '">' +
         '<video src="' + g.url + '" controls controlsList="nofullscreen nodownload" disablePictureInPicture preload="metadata"></video>' +
         '<img class="sc-ov" alt="">' +
       '</div>' +
       '<div class="sc-b">' +
-      '<div class="trim"><span>IN</span><input type="range" data-r="in" min="0" max="' + g.dur.toFixed(2) + '" step="0.05" value="' + g.trimIn + '"></div>' +
-      '<div class="trim" style="margin-top:4px"><span>OUT</span><input type="range" data-r="out" min="0" max="' + g.dur.toFixed(2) + '" step="0.05" value="' + g.trimOut + '"></div>' +
-      '<div class="hint" style="margin-top:6px">Framed as it will appear. The graphics are added when you assemble.</div>' +
+      '<div class="hint">Framed as it will appear. The graphics are added when you assemble. ' +
+      'To shorten a take, delete it and record again.</div>' +
       '<div class="sc-a"><button data-a="up">↑</button><button data-a="dn">↓</button>' +
       '<button data-a="re">Retake</button><button data-a="rn">Rename</button>' +
       '<button data-a="dl">Save</button><button class="del" data-a="rm">Delete</button></div></div>';
     const vid = d.querySelector("video");
     dressPreview(d, g);
-    d.querySelectorAll("input[data-r]").forEach(r => r.oninput = () => {
-      const v = +r.value;
-      if (r.dataset.r === "in") { g.trimIn = Math.min(v, g.trimOut - 0.2); r.value = g.trimIn; }
-      else { g.trimOut = Math.max(v, g.trimIn + 0.2); r.value = g.trimOut; }
-      vid.currentTime = r.dataset.r === "in" ? g.trimIn : g.trimOut;
-      d.querySelector(".sc-d").textContent = fmtDur(g.trimOut - g.trimIn);
-      updateShowLen();
-    });
     d.querySelectorAll("[data-a]").forEach(b => b.onclick = () => {
       const a = b.dataset.a;
       if (a === "up" && i > 0) S.segs.splice(i - 1, 0, S.segs.splice(i, 1)[0]);
@@ -2454,7 +2445,7 @@ function renderSegs() {
 }
 function updateShowLen() {
   $("mTakes").textContent = S.segs.length;
-  const tot = S.segs.reduce((a, t) => a + (t.trimOut - t.trimIn), 0);
+  const tot = S.segs.reduce((a, t) => a + (+t.dur || 0), 0);
   if (S.segs.length) $("mShow").textContent = fmtDur(tot);
   $("btnAssemble").disabled = !S.segs.length;
 }
@@ -2537,21 +2528,25 @@ $("btnRender").onclick = async () => {
   cancelAssembly = false; $("btnCancel").disabled = false;
   $("pubLog").textContent = "Joining " + S.segs.length + " segment(s).";
   try {
-    let blob, cues;
-    try {
-      ({ blob, cues } = await assembleFF());
-    } catch (e) {
-      plog("Video engine unavailable (" + (e.message || e) + ").");
-      plog("Falling back to the real-time method \u2014 expect a pause at each join.");
-      ({ blob, cues } = await assemble());
-    }
+    /* One assembler, and it either produces the branded show or stops. There used
+       to be a fallback here; all it could produce was bare camera with no graphics,
+       and it ran on any error, which is how finished shows lost their template. */
+    const { blob, cues } = await assembleFF();
     S.finalBlob = blob; S.finalCues = cues;
     showReview();
     $("btnDl").disabled = $("btnDlCap").disabled = false;
     $("btnYT").disabled = !(HAS_GAS || DESK.client);
     $("ytDesc").value += "\n\n" + chapterList(cues);
     plog("Done — " + (blob.size / 1048576).toFixed(1) + " MB.");
-  } catch (e) { plog("Assembly failed: " + e.message); }
+  } catch (e) {
+    const why = (e && e.message) || String(e);
+    plog("");
+    plog("ASSEMBLY STOPPED — nothing was produced.");
+    plog(why);
+    plog("");
+    plog("Nothing is lost: your takes are still in the rundown. Send me this log.");
+    toast("Assembly stopped: " + why + " — your takes are safe, nothing was deleted.", true);
+  }
   btn.disabled = false; $("btnCancel").disabled = true;
 };
 
@@ -2569,96 +2564,13 @@ function once(el, ev, ms, label) {
 }
 let cancelAssembly = false;
 
-async function assemble() {
-  const c = document.createElement("canvas"); c.width = canW(); c.height = canH();
-  const x = c.getContext("2d");
-  x.imageSmoothingQuality = "high";
-  const ac = new (window.AudioContext || window.webkitAudioContext)();
-  const dest = ac.createMediaStreamDestination();
-  const cs = c.captureStream(30);
-  dest.stream.getAudioTracks().forEach(t => cs.addTrack(t));
-  /* the second encode is where a show goes soft — give it headroom */
-  const rec = new MediaRecorder(cs, { mimeType: pickMime(),
-    videoBitsPerSecond: Math.round(+$("qual").value * 1.5), audioBitsPerSecond: 192000 });
-  const parts = []; rec.ondataavailable = e => e.data.size && parts.push(e.data);
-  const done = new Promise(r => rec.onstop = r);
-  rec.start(1000);
-
-  /* Load every take before the recorder opens. The old code loaded, seeked and
-     started each clip mid-render, and the recorder faithfully captured that
-     stall as a pause on a frozen frame between every segment. */
-  plog("Loading " + S.segs.length + " segment(s)…");
-  const prepped = [];
-  for (const tk of S.segs) {
-    const v = document.createElement("video");
-    v.src = tk.url; v.muted = false; v.playsInline = true; v.preload = "auto";
-    await once(v, "loadedmetadata", 10000, "metadata");
-    await once(v, "canplaythrough", 8000, "buffer");
-    prepped.push(v);
-  }
-
-  const cues = []; let offset = 0;
-  const oD = $("openOn").checked ? openDur() : 0;
-  const cD = $("closeOn").checked ? 5 : 0;
-  const total = S.segs.reduce((a, t) => a + (t.trimOut - t.trimIn), 0) + oD + cD;
-
-  if (oD) {
-    if (rec.state === "paused") rec.resume();
-    plog("Rolling the open (" + oD + "s)…");
-    await fontsReady();
-    await playSequence(x, drawOpen, oD, ac, dest, pr => pbar(pr * oD / total));
-    offset += oD;
-  }
-
-  for (let i = 0; i < S.segs.length; i++) {
-    const tk = S.segs[i];
-    plog("Segment " + (i + 1) + "/" + S.segs.length + " · " + tk.label);
-    const v = prepped[i];
-    const src = ac.createMediaElementSource(v); src.connect(dest);
-    if (tk.trimIn > 0.05) {
-      v.currentTime = tk.trimIn;
-      await once(v, "seeked", 6000, "seek");
-    }
-    /* hold the recorder over the join so no dead frames are captured */
-    if (rec.state === "recording") rec.pause();
-    try { await v.play(); } catch (e) { plog("  (play refused: " + e.message + ")"); }
-    if (rec.state === "paused") rec.resume();
-    tk.cues.forEach(q => { if (q.t >= tk.trimIn && q.t <= tk.trimOut) cues.push({ t: q.t - tk.trimIn + offset, text: q.text, itemIdx: q.itemIdx }); });
-    await new Promise(res => {
-      /* requestVideoFrameCallback fires once per decoded frame, so nothing is
-         duplicated or dropped on the way through. rAF is the fallback. */
-      const useRVFC = typeof v.requestVideoFrameCallback === "function";
-      let last = -1, stalled = 0, watch = setInterval(() => {
-        if (v.currentTime === last) { stalled++; } else { stalled = 0; last = v.currentTime; }
-        if (stalled >= 6) {                      // three seconds without a new frame
-          clearInterval(watch); v.pause();
-          plog("  (segment stalled at " + v.currentTime.toFixed(1) + "s \u2014 moving on)");
-          res();
-        }
-      }, 500);
-      const finish = () => { clearInterval(watch); v.pause(); res(); };
-      const step = () => {
-        if (cancelAssembly) return finish();
-        if (v.currentTime >= tk.trimOut || v.ended) return finish();
-        x.setTransform(1, 0, 0, 1, 0, 0);
-        x.drawImage(v, 0, 0, c.width, c.height);
-        pbar((offset + (v.currentTime - tk.trimIn)) / total);
-        useRVFC ? v.requestVideoFrameCallback(step) : requestAnimationFrame(step);
-      };
-      useRVFC ? v.requestVideoFrameCallback(step) : requestAnimationFrame(step);
-    });
-    if (rec.state === "recording") rec.pause();
-    src.disconnect();
-    offset += tk.trimOut - tk.trimIn;
-  }
-  if (rec.state === "paused") rec.resume();
-  if (cD) {
-    plog("Rolling the close…");
-    await playSequence(x, drawClose, cD, null, null, pr => pbar((offset + pr * cD) / total));
-  }
-  pbar(1); rec.stop(); await done; ac.close();
-  return { blob: new Blob(parts, { type: rec.mimeType }), cues };
-}
+/* The real-time canvas assembler that used to live here has been deleted.
+   It drew each take straight to the canvas at full frame — no backdrop, no
+   picture panel, no banner, no window frame — because it was written when
+   recording filmed the canvas and the graphics were already in the video.
+   Once recording moved to the camera track, this path could only ever emit a
+   bare, stretched talking head, and it ran silently whenever the real
+   assembler hit any error at all. There is now exactly one assembler. */
 
 
 /* ============================================================
@@ -3620,9 +3532,9 @@ async function prepareSegment(seg) {
 
   async function composite(src) {
     const look = S.look || "window";        // the control, not whatever was set when it recorded
-    const tIn = Math.max(0, +seg.trimIn || 0);
-    const tOut = (seg.trimOut != null && isFinite(seg.trimOut)) ? +seg.trimOut : realDur;
-    const useDur = Math.max(0.5, Math.min(tOut - tIn, realDur));
+    /* Whole take, always. Per-segment trimming is gone: it added a second code path
+       through compositing, and clips that took it came out with no graphics. */
+    const useDur = realDur;
     const R = camRect(look);
     const png = "ov_" + seg.id + ".png";
     /* slot 0 is a real key, so test for absence rather than falsiness —
@@ -3645,9 +3557,7 @@ async function prepareSegment(seg) {
       aChain += ",afade=t=in:st=0:d=" + fade + ",afade=t=out:st=" + outAt + ":d=" + fade;
     } else chain += ";[vv]null[v]";
 
-    const a = [];
-    if (tIn > 0.05) a.push("-ss", tIn.toFixed(3));
-    a.push("-i", src, "-loop", "1", "-i", png);
+    const a = ["-i", src, "-loop", "1", "-i", png];
     if (S.ffThreads) a.push("-threads", String(S.ffThreads));
     a.push("-filter_complex", chain, "-map", "[v]", "-map", "0:a?", "-af", aChain,
       ...encFlags(), "-t", useDur.toFixed(3),
@@ -3706,7 +3616,6 @@ function segKey(seg) {
   const st = it ? strapFor(it) : { title: "", sub: "" };
   const a = adjOf(it);
   return [normSpec(), S.look, S.bgKey, seg.shownKey,
-          (+seg.trimIn || 0).toFixed(2), (+seg.trimOut || 0).toFixed(2),
           it && it.image ? it.image.length : -1,
           st.title, st.sub, a.fit, a.y, a.z,
           $("gImg").checked ? 1 : 0, $("gLower").checked ? 1 : 0,
@@ -3791,6 +3700,20 @@ async function overlayPNG(shownKey, look, bgKey) {
 
   drawBug(x);                 // always last, so nothing can clip it
 
+  /* Prove the template actually painted before it is burned into the show.
+     The Window look must have an opaque backdrop down the left edge, clear of
+     the picture panel. If that strip is empty the overlay is blank, and a blank
+     overlay is indistinguishable from no template at all — so stop here and say
+     so, rather than shipping a bare talking head and finding out on YouTube. */
+  if (look === "window") {
+    const sx = Math.round(20 / OUT_W * c.width);
+    const px = x.getImageData(sx, Math.round(c.height * 0.25), 1, 1).data;
+    const py = x.getImageData(sx, Math.round(c.height * 0.60), 1, 1).data;
+    if (px[3] < 250 || py[3] < 250)
+      throw new Error("The template did not render for “" + (item ? item.slug : "this segment") +
+        "”, so the show would have come out as bare camera. Nothing was assembled.");
+  }
+
   return new Promise(res => c.toBlob(res, "image/png"));
 }
 
@@ -3833,8 +3756,7 @@ async function assembleFF() {
     plog("Segment " + (i + 1) + "/" + S.segs.length + " \u00b7 " + tk.label + " (prepared)");
     await blobToFF(ff, pre, tk.normBlob);
     list.push({ name: pre, dur: tk.outDur || tk.dur, pre: true });
-    tk.cues.forEach(q => { if (q.t >= (tk.trimIn || 0) && q.t <= (tk.trimOut != null ? tk.trimOut : 1e9))
-      cues.push({ t: q.t - (tk.trimIn || 0) + offset, text: q.text, itemIdx: q.itemIdx }); });
+    tk.cues.forEach(q => cues.push({ t: q.t + offset, text: q.text, itemIdx: q.itemIdx }));
     offset += tk.outDur || tk.dur;
   }
 
