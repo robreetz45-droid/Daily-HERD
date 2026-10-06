@@ -670,7 +670,7 @@ function fileExt() {
   return f ? f[2] : "webm";
 }
 
-const BUILD = "2026-10-06c";   /* shown in the tally bar and printed at the top of
+const BUILD = "2026-10-06d";   /* shown in the tally bar and printed at the top of
    every assembly log, so which file the browser actually loaded is never a guess */
 const ovCache = new Map();      // rendered overlays, keyed by what they depend on
 const HAS_GAS = (typeof google !== "undefined" && google.script && google.script.run);
@@ -3307,6 +3307,10 @@ async function ffLoad() {
   try { return await ffLoading; } catch (e) { ffLoading = null; throw e; }
 }
 
+function kb(n) {
+  if (!n) return "0 bytes";
+  return n < 1048576 ? Math.round(n / 1024) + " KB" : (n / 1048576).toFixed(1) + " MB";
+}
 async function blobToFF(ff, name, blob) {
   const bytes = new Uint8Array(await blob.arrayBuffer());
   if (!bytes.length) throw new Error("that recording is empty (0 bytes)");
@@ -3746,19 +3750,36 @@ async function assembleFF() {
      meant finding them one reload at a time; and a bad take used to take the whole
      show down a path that produced no graphics at all. */
   if (!S.segs.length) throw new Error("There are no takes in the rundown yet.");
-  const duds = S.segs
-    .map((g, i) => ({ g: g, n: i + 1 }))
-    .filter(o => !o.g.blob || o.g.blob.size < 50000);
+
+  /* Read every take, don't just ask how big it says it is. A Blob reports a size
+     from its own bookkeeping; the bytes behind it are fetched separately and can
+     come back empty while the size still looks healthy. Checking .size alone let
+     exactly that through, so the real numbers are printed here, side by side. */
+  const duds = [];
+  plog("Checking the takes…");
+  for (let i = 0; i < S.segs.length; i++) {
+    const g = S.segs[i];
+    let read = 0, err = null;
+    try {
+      read = g.blob ? (await g.blob.arrayBuffer()).byteLength : 0;
+    } catch (e) { err = (e && e.message) || String(e); }
+    const claims = g.blob ? g.blob.size : 0;
+    plog("  " + (i + 1) + ". “" + g.label + "” — says " + kb(claims) +
+      ", reads " + kb(read) + (err ? "  [" + err + "]" : "") +
+      (read && read === claims ? "  ok" : ""));
+    if (read < 50000) duds.push({ n: i + 1, label: g.label, claims: claims, read: read });
+  }
   if (duds.length) {
+    const ghost = duds.filter(d => d.claims >= 50000).length;
     plog("");
-    duds.forEach(o => plog("  • " + o.n + ". “" + o.g.label + "” — " +
-      (o.g.blob ? Math.round(o.g.blob.size / 1024) + " KB" : "no video at all")));
+    if (ghost) plog("These takes report a size but hold no data — the video behind them is gone.");
     throw new Error(duds.length === 1
-      ? "Take " + duds[0].n + ", “" + duds[0].g.label + "”, did not record. Delete it from the " +
-        "rundown and record it again, then assemble."
-      : "These " + duds.length + " takes did not record (listed above). Delete each one from the " +
+      ? "Take " + duds[0].n + ", “" + duds[0].label + "”, has no usable video. Delete it from " +
+        "the rundown and record it again, then assemble."
+      : "These " + duds.length + " takes have no usable video (listed above). Delete each one from the " +
         "rundown and record them again, then assemble.");
   }
+  plog("All " + S.segs.length + " takes read back in full.");
 
   const ff = await ffLoad();
   const ext = fileExt();
