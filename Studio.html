@@ -252,6 +252,7 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
 .sc-h b{font-family:var(--display);font-size:17px;letter-spacing:.05em;text-transform:uppercase;line-height:1.05}
 .sc-h .sc-d{font-family:var(--mono);font-size:11px;color:var(--mist-dim)}
 .sc-org{grid-column:2/4;font-size:11px;color:var(--mist);letter-spacing:.05em;text-transform:uppercase;margin-top:-3px}
+.sc-bad{margin-left:8px;padding:2px 7px;border-radius:4px;background:#5A1111;color:#FFD9D9;font-family:var(--mono);font-size:9px;letter-spacing:.06em}
 .sc-b{padding:0 10px 10px}
 .sc-a{display:flex;gap:4px;flex-wrap:wrap;margin-top:8px}
 .sc-a button{background:transparent;border:1px solid var(--line2);color:var(--mist);border-radius:6px;
@@ -2234,28 +2235,46 @@ function beginRec() {
     atracks.forEach(t => cs.addTrack(t));
   }
   S.recDirect = direct;
-  S.chunks = []; S.recCues = []; S.discard = false;
+  S.recCues = []; S.discard = false;
   S.paused = false; S.pausedTotal = 0; S.pausedAt = 0;
-  S.recorder = new MediaRecorder(cs, { mimeType: pickMime(), videoBitsPerSecond: +$("qual").value, audioBitsPerSecond: 128000 });
-  S.recorder.ondataavailable = e => e.data.size && S.chunks.push(e.data);
-  S.recorder.onstop = onRecStop;
-  S.recorder.start(1000);
+
+  /* Each take owns its own chunk list and its own recorder reference.
+     These used to be single slots on S. stop() fires onstop asynchronously, so
+     starting the next take before the previous one had finished closing out
+     replaced the array the finishing take was about to read — and it built its
+     file from the new, empty one. The take kept its name and its duration and
+     came out at zero bytes, which is not something you can see until assembly. */
+  const chunks = [];
+  const rec = new MediaRecorder(cs, { mimeType: pickMime(), videoBitsPerSecond: +$("qual").value, audioBitsPerSecond: 128000 });
+  S.chunks = chunks; S.recorder = rec;
+  rec.ondataavailable = e => e.data.size && chunks.push(e.data);
+  rec.onstop = () => onRecStop(rec, chunks);
+  rec.start(1000);
   if ($("ovlAuto").checked && !document.body.classList.contains("ovlOn")) ovlOpen(true);
   S.recording = true; S.recStart = performance.now(); S.recPeak = 0; S.warnedFps = false;
   S.rolling = true; $("btnRoll").textContent = "Pause";
   setTransport("rec");
   renderRundown();
 }
-function onRecStop() {
+function onRecStop(rec, chunks) {
   const dur = S.lastDur;
   S.recording = false; S.rolling = false; S.paused = false;
   $("btnRoll").textContent = "Roll"; $("tc").textContent = "00:00.0";
   if (S.discard) {
-    S.discard = false; S.chunks = [];
+    S.discard = false;
     renderRundown();
     return startCountdown();                    // straight back into 3 · 2 · 1
   }
-  const blob = new Blob(S.chunks, { type: S.recorder.mimeType });
+  /* rec and chunks belong to the take that just finished, never to one that has
+     since started — read them, not whatever S happens to be pointing at now. */
+  const blob = new Blob(chunks, { type: rec.mimeType });
+  /* An empty take is never worth keeping, and keeping one used to poison the whole
+     show: assembly would fail on it and fall through to a path with no graphics. */
+  if (blob.size === 0) {
+    renderSegs(); renderRundown();
+    return toast("That take recorded nothing at all \u2014 no video came back from the camera. " +
+      "Nothing was added to the rundown. Check the camera preview is live, then roll again.", true);
+  }
   const key = S.armed ? S.armed.key : nextKey();
   S.segs.push({
     id: "s" + Date.now(), key: key, blob, url: URL.createObjectURL(blob), dur,
@@ -2382,6 +2401,8 @@ function renderSegs() {
     d.innerHTML =
       '<div class="sc-h"><span class="sc-n">' + String(i + 1).padStart(2, "0") + '</span>' +
       '<b>' + esc(g.label) + '</b><span class="sc-d">' + fmtDur(g.dur) + '</span>' +
+      (g.blob && g.blob.size < 50000
+        ? '<span class="sc-bad">DID NOT RECORD \u2014 DELETE AND RETAKE</span>' : '') +
       (g.org ? '<span class="sc-org">' + esc(g.org) + '</span>' : '') + '</div>' +
       '<div class="sc-stage" data-stage="' + i + '">' +
         '<video src="' + g.url + '" controls controlsList="nofullscreen nodownload" disablePictureInPicture preload="metadata"></video>' +
@@ -3718,6 +3739,24 @@ async function overlayPNG(shownKey, look, bgKey) {
 }
 
 async function assembleFF() {
+  /* Check every take before anything else happens. Failing on the first bad one
+     meant finding them one reload at a time; and a bad take used to take the whole
+     show down a path that produced no graphics at all. */
+  if (!S.segs.length) throw new Error("There are no takes in the rundown yet.");
+  const duds = S.segs
+    .map((g, i) => ({ g: g, n: i + 1 }))
+    .filter(o => !o.g.blob || o.g.blob.size < 50000);
+  if (duds.length) {
+    plog("");
+    duds.forEach(o => plog("  • " + o.n + ". “" + o.g.label + "” — " +
+      (o.g.blob ? Math.round(o.g.blob.size / 1024) + " KB" : "no video at all")));
+    throw new Error(duds.length === 1
+      ? "Take " + duds[0].n + ", “" + duds[0].g.label + "”, did not record. Delete it from the " +
+        "rundown and record it again, then assemble."
+      : "These " + duds.length + " takes did not record (listed above). Delete each one from the " +
+        "rundown and record them again, then assemble.");
+  }
+
   const ff = await ffLoad();
   const ext = fileExt();
 
