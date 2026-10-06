@@ -294,6 +294,7 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
     <div>Gaps<b id="mGaps">0</b></div>
     <div>FPS<b id="mFps">--</b></div>
     <div>Level<div class="lvl" id="lvl"></div></div>
+    <div>Build<b id="mBuild">--</b></div>
   </div>
   <div class="brandmark">
     <img class="mvmark" id="tallyLogo" alt="Mounds View">
@@ -669,6 +670,8 @@ function fileExt() {
   return f ? f[2] : "webm";
 }
 
+const BUILD = "2026-10-06c";   /* shown in the tally bar and printed at the top of
+   every assembly log, so which file the browser actually loaded is never a guess */
 const ovCache = new Map();      // rendered overlays, keyed by what they depend on
 const HAS_GAS = (typeof google !== "undefined" && google.script && google.script.run);
 const OUT_W = 1280, OUT_H = 720;          // design space — all layout is in these units
@@ -2547,7 +2550,7 @@ $("btnCancel").onclick = () => { cancelAssembly = true; plog("Stopping\u2026"); 
 $("btnRender").onclick = async () => {
   const btn = $("btnRender"); btn.disabled = true;
   cancelAssembly = false; $("btnCancel").disabled = false;
-  $("pubLog").textContent = "Joining " + S.segs.length + " segment(s).";
+  $("pubLog").textContent = "Studio build " + BUILD + " \u00b7 joining " + S.segs.length + " segment(s).";
   try {
     /* One assembler, and it either produces the branded show or stops. There used
        to be a fallback here; all it could produce was bare camera with no graphics,
@@ -4142,6 +4145,7 @@ function pressSeg(group, value) {
   if (!hit) btns[0].setAttribute("aria-pressed", "true");
 }
 function applyDefaults() {
+  const bs = $("mBuild"); if (bs) bs.textContent = BUILD;
   S.look = "window";        // camera in its own frame, matching the picture
   S.mode = "off";           // no background removal
   S.bgKey = "green";        // studio green behind
