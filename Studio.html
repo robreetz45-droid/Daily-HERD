@@ -253,6 +253,8 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
 .sc-h .sc-d{font-family:var(--mono);font-size:11px;color:var(--mist-dim)}
 .sc-org{grid-column:2/4;font-size:11px;color:var(--mist);letter-spacing:.05em;text-transform:uppercase;margin-top:-3px}
 .sc-bad{margin-left:8px;padding:2px 7px;border-radius:4px;background:#5A1111;color:#FFD9D9;font-family:var(--mono);font-size:9px;letter-spacing:.06em}
+.sc-slot{display:grid;grid-template-columns:44px 1fr;gap:6px;align-items:center;margin-bottom:7px;font-family:var(--mono);font-size:10px;color:var(--mist-dim)}
+.sc-slot select{width:100%;background:var(--panel2);color:var(--mist);border:1px solid var(--line2);border-radius:6px;padding:3px 6px;font-size:11px}
 .sc-b{padding:0 10px 10px}
 .sc-a{display:flex;gap:4px;flex-wrap:wrap;margin-top:8px}
 .sc-a button{background:transparent;border:1px solid var(--line2);color:var(--mist);border-radius:6px;
@@ -590,6 +592,7 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
         <button class="btn" id="btnCancel" disabled>Stop</button>
         <button class="btn" id="btnDl" disabled>2 · Download video</button>
         <button class="btn" id="btnDlCap" disabled>Download captions</button>
+        <button class="btn" id="btnCopyLog">Copy log</button>
         <button class="btn go" id="btnYT" disabled>3 · Send to YouTube</button>
       </div>
       <p class="note" id="ytNote"></p>
@@ -670,7 +673,7 @@ function fileExt() {
   return f ? f[2] : "webm";
 }
 
-const BUILD = "2026-10-06d";   /* shown in the tally bar and printed at the top of
+const BUILD = "2026-10-06h";   /* shown in the tally bar and printed at the top of
    every assembly log, so which file the browser actually loaded is never a guess */
 const ovCache = new Map();      // rendered overlays, keyed by what they depend on
 const HAS_GAS = (typeof google !== "undefined" && google.script && google.script.run);
@@ -2395,6 +2398,36 @@ function dressPreview(card, seg) {
   }).catch(() => {});
 }
 
+/* Bring takes back in from disk. A take saved with the Save button on its card is
+   an ordinary video file, so a show can be rebuilt after a reload, a crash, or a
+   browser that will not hand its own recording back. Files arrive in the order you
+   pick them; the slot and the name are yours to set afterwards, same as a take
+   recorded here. */
+async function importTakes(files) {
+  const list = Array.from(files || []);
+  if (!list.length) return;
+  let added = 0, skipped = [];
+  for (const f of list) {
+    if (f.size < 50000) { skipped.push(f.name + " (" + kb(f.size) + ")"); continue; }
+    let dur = 0;
+    try { dur = await blobDuration(f); } catch (e) {}
+    if (!isFinite(dur) || dur <= 0) dur = 0;
+    const key = nextKey();
+    const name = f.name.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim();
+    S.segs.push({
+      id: "s" + Date.now() + "_" + added, key: key, blob: f, url: URL.createObjectURL(f), dur: dur,
+      direct: true, shownKey: key, look: S.look, bgKey: S.bgKey,
+      cues: [], label: name || slotLabel(key), org: slotOrg(key)
+    });
+    added++;
+  }
+  renderSegs(); renderRundown();
+  if (skipped.length)
+    toast("Skipped " + skipped.length + " file(s) that hold no video: " + skipped.join(", "), true);
+  if (added)
+    toast("Added " + added + " take(s) from files. Check the STORY box on each card points at the " +
+      "right item, then assemble.");
+}
 function renderSegs() {
   const box = $("segList"); if (!box) return;
   box.innerHTML = "";
@@ -2414,11 +2447,27 @@ function renderSegs() {
       '<div class="sc-b">' +
       '<div class="hint">Framed as it will appear. The graphics are added when you assemble. ' +
       'To shorten a take, delete it and record again.</div>' +
+      '<div class="sc-slot"><span>STORY</span><select data-slot="' + i + '">' +
+        slotList().map(o => '<option value="' + o.key + '"' +
+          (String(o.key) === String(g.shownKey != null ? g.shownKey : g.key) ? " selected" : "") +
+          '>' + esc(o.label) + '</option>').join("") + '</select></div>' +
       '<div class="sc-a"><button data-a="up">↑</button><button data-a="dn">↓</button>' +
       '<button data-a="re">Retake</button><button data-a="rn">Rename</button>' +
       '<button data-a="dl">Save</button><button class="del" data-a="rm">Delete</button></div></div>';
     const vid = d.querySelector("video");
     dressPreview(d, g);
+    /* Point a take at the story it belongs to. The picture and the banner follow
+       whatever is chosen here, so an imported take can be placed just like a
+       recorded one. */
+    const slotSel = d.querySelector("select[data-slot]");
+    if (slotSel) slotSel.onchange = function () {
+      const v = this.value;
+      const k = (v === "open" || v === "close" || v === "extra") ? v : +v;
+      g.key = k; g.shownKey = k;
+      g.label = slotLabel(k); g.org = slotOrg(k);
+      g.normBlob = null; g.normKey = null;          // its graphics have to be rebuilt
+      renderSegs(); renderRundown();
+    };
     d.querySelectorAll("[data-a]").forEach(b => b.onclick = () => {
       const a = b.dataset.a;
       if (a === "up" && i > 0) S.segs.splice(i - 1, 0, S.segs.splice(i, 1)[0]);
@@ -2442,7 +2491,11 @@ function renderSegs() {
     add.innerHTML =
       '<button class="plusbtn" id="btnPlus" aria-label="Add a segment">+</button>' +
       '<div class="lbl">Add segment</div>' +
-      '<div class="hint">' + (S.segs.length ? "Next up: " + esc(slotLabel(nextKey())) : "Start with the open, then work down the rundown.") + '</div>';
+      '<div class="hint">' + (S.segs.length ? "Next up: " + esc(slotLabel(nextKey())) : "Start with the open, then work down the rundown.") + '</div>' +
+      '<div class="hint" style="margin-top:9px;border-top:1px solid var(--line2);padding-top:9px">' +
+      'Already have takes saved on this computer?<br>' +
+      '<button class="btn sm" id="btnImport" style="margin-top:6px">Add takes from files</button></div>' +
+      '<input type="file" id="fileTakes" accept="video/*" multiple hidden>';
   } else {
     const opts = slotList().map(o =>
       '<option value="' + o.key + '"' + (String(o.key) === String(S.armed.key) ? " selected" : "") + '>' +
@@ -2459,6 +2512,8 @@ function renderSegs() {
   box.appendChild(add);
 
   if ($("btnPlus")) $("btnPlus").onclick = () => armSlot(null);
+  if ($("btnImport")) $("btnImport").onclick = () => $("fileTakes").click();
+  if ($("fileTakes")) $("fileTakes").onchange = function () { importTakes(this.files); this.value = ""; };
   if ($("armRec")) $("armRec").onclick = startCountdown;
   if ($("armPick")) $("armPick").onchange = function () {
     const v = this.value;
@@ -2546,6 +2601,22 @@ $("pubModal").addEventListener("pointerdown", e => { if (e.target === $("pubModa
 function plog(m) { const l = $("pubLog"); l.textContent += "\n" + m; l.scrollTop = l.scrollHeight; }
 function pbar(p) { $("pubBar").style.width = Math.round(p * 100) + "%"; }
 
+/* Photographing a scrolling log pane is a poor way to report a fault, and the
+   line that matters is usually the one that has scrolled out of view. */
+$("btnCopyLog").onclick = async () => {
+  const txt = "Studio " + BUILD + "\n" + $("pubLog").textContent;
+  try {
+    await navigator.clipboard.writeText(txt);
+    toast("Log copied \u2014 paste it straight into the chat.");
+  } catch (e) {
+    const t = document.createElement("textarea");
+    t.value = txt; t.style.position = "fixed"; t.style.top = "-1000px";
+    document.body.appendChild(t); t.select();
+    try { document.execCommand("copy"); toast("Log copied \u2014 paste it straight into the chat."); }
+    catch (e2) { toast("Couldn't copy automatically \u2014 select the log text and press Ctrl+C.", true); }
+    document.body.removeChild(t);
+  }
+};
 $("btnCancel").onclick = () => { cancelAssembly = true; plog("Stopping\u2026"); };
 $("btnRender").onclick = async () => {
   const btn = $("btnRender"); btn.disabled = true;
@@ -3311,9 +3382,37 @@ function kb(n) {
   if (!n) return "0 bytes";
   return n < 1048576 ? Math.round(n / 1024) + " KB" : (n / 1048576).toFixed(1) + " MB";
 }
-async function blobToFF(ff, name, blob) {
-  const bytes = new Uint8Array(await blob.arrayBuffer());
-  if (!bytes.length) throw new Error("that recording is empty (0 bytes)");
+/* Read a take's bytes, and do not take the first answer as final. A Blob can
+   report a healthy size and still hand back nothing, so when the two disagree
+   this tries two other routes before giving up, and says exactly what happened
+   rather than reporting a bare zero that nothing downstream can explain. */
+async function readBlob(blob, label) {
+  const claims = blob ? blob.size : 0;
+  const tries = [];
+  const ways = [
+    ["direct", async () => new Uint8Array(await blob.arrayBuffer())],
+    ["re-sliced", async () => new Uint8Array(await blob.slice(0, blob.size).arrayBuffer())],
+    ["file reader", () => new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res(new Uint8Array(r.result));
+      r.onerror = () => rej(r.error || new Error("FileReader failed"));
+      r.readAsArrayBuffer(blob);
+    })]
+  ];
+  for (const [how, go] of ways) {
+    let got = null, err = null;
+    try { got = await go(); } catch (e) { err = (e && e.message) || String(e); }
+    tries.push(how + ": " + (err ? err : kb(got.length)));
+    if (got && got.length) {
+      if (tries.length > 1) plog("   (read via " + how + " after " + (tries.length - 1) + " failed attempt(s))");
+      return got;
+    }
+  }
+  throw new Error("\u201c" + label + "\u201d says it is " + kb(claims) + " but returned no data when read. " +
+    "Tried " + tries.join("; ") + ". Delete that take from the rundown and record it again.");
+}
+async function blobToFF(ff, name, blob, label) {
+  const bytes = await readBlob(blob, label || name);
   await ff.writeFile(name, bytes);
   return bytes.length;
 }
@@ -3529,12 +3628,12 @@ async function prepareSegment(seg) {
   const outName = "n_out_" + seg.id + ".mp4";
   const cleanup = [];
 
-  const inBytes = await blobToFF(ff, inName, seg.blob);
+  const inBytes = await blobToFF(ff, inName, seg.blob, seg.label);
   cleanup.push(inName);
-  plog("   " + (inBytes / 1048576).toFixed(1) + " MB · " + (seg.blob.type || "unknown type"));
+  plog("   " + kb(inBytes) + " · " + (seg.blob.type || "unknown type"));
   if (inBytes < 50000)
-    throw new Error("“" + seg.label + "” is only " + inBytes + " bytes, so it did not " +
-      "record properly. Delete that segment and record it again.");
+    throw new Error("“" + seg.label + "” read back only " + kb(inBytes) + " though it reports " +
+      kb(seg.blob.size) + ". Delete that take from the rundown and record it again.");
 
   const W = canW(), H = canH(), FPS = OPEN_FPS;
   const probed = await blobDuration(seg.blob);
@@ -3761,7 +3860,7 @@ async function assembleFF() {
     const g = S.segs[i];
     let read = 0, err = null;
     try {
-      read = g.blob ? (await g.blob.arrayBuffer()).byteLength : 0;
+      read = g.blob ? (await readBlob(g.blob, g.label)).length : 0;
     } catch (e) { err = (e && e.message) || String(e); }
     const claims = g.blob ? g.blob.size : 0;
     plog("  " + (i + 1) + ". “" + g.label + "” — says " + kb(claims) +
