@@ -673,7 +673,7 @@ function fileExt() {
   return f ? f[2] : "webm";
 }
 
-const BUILD = "2026-10-06h";   /* shown in the tally bar and printed at the top of
+const BUILD = "2026-10-18a";   /* shown in the tally bar and printed at the top of
    every assembly log, so which file the browser actually loaded is never a guess */
 const ovCache = new Map();      // rendered overlays, keyed by what they depend on
 const HAS_GAS = (typeof google !== "undefined" && google.script && google.script.run);
@@ -3624,12 +3624,20 @@ function blobDuration(blob) {
    a queue, so the order can never drift from the order on screen. */
 async function prepareSegment(seg) {
   const ff = await ffLoad();
-  const inName = "n_in_" + seg.id + "." + extForBlob(seg.blob);
   const outName = "n_out_" + seg.id + ".mp4";
   const cleanup = [];
 
-  const inBytes = await blobToFF(ff, inName, seg.blob, seg.label);
-  cleanup.push(inName);
+  /* The pre-flight already read this take and wrote it into the engine. Reading
+     the blob a second time is exactly what used to fail, so it is not done. */
+  let inName = seg.ffIn, inBytes = 0;
+  if (inName) {
+    try { inBytes = (await ff.readFile(inName)).length; } catch (e) { inName = null; }
+  }
+  if (!inName) {
+    inName = "n_in_" + seg.id + "." + extForBlob(seg.blob);
+    inBytes = await blobToFF(ff, inName, seg.blob, seg.label);
+    cleanup.push(inName);
+  }
   plog("   " + kb(inBytes) + " · " + (seg.blob.type || "unknown type"));
   if (inBytes < 50000)
     throw new Error("“" + seg.label + "” read back only " + kb(inBytes) + " though it reports " +
@@ -3850,17 +3858,26 @@ async function assembleFF() {
      show down a path that produced no graphics at all. */
   if (!S.segs.length) throw new Error("There are no takes in the rundown yet.");
 
-  /* Read every take, don't just ask how big it says it is. A Blob reports a size
-     from its own bookkeeping; the bytes behind it are fetched separately and can
-     come back empty while the size still looks healthy. Checking .size alone let
-     exactly that through, so the real numbers are printed here, side by side. */
+  /* Read every take exactly once, and hand the bytes straight to the video engine.
+     This used to read each take here, throw the bytes away, and read the same blob
+     again a moment later when preparing it. The first read always worked; the
+     second came back empty, which is how a recording that saves to disk perfectly
+     was reported as nought bytes. One read, kept. */
+  const ff = await ffLoad();
   const duds = [];
   plog("Checking the takes…");
   for (let i = 0; i < S.segs.length; i++) {
     const g = S.segs[i];
     let read = 0, err = null;
     try {
-      read = g.blob ? (await readBlob(g.blob, g.label)).length : 0;
+      if (g.blob) {
+        const bytes = await readBlob(g.blob, g.label);
+        read = bytes.length;
+        if (read >= 50000) {
+          g.ffIn = "n_in_" + g.id + "." + extForBlob(g.blob);
+          await ff.writeFile(g.ffIn, bytes);     // in the engine now; never read again
+        }
+      }
     } catch (e) { err = (e && e.message) || String(e); }
     const claims = g.blob ? g.blob.size : 0;
     plog("  " + (i + 1) + ". “" + g.label + "” — says " + kb(claims) +
@@ -3878,9 +3895,8 @@ async function assembleFF() {
       : "These " + duds.length + " takes have no usable video (listed above). Delete each one from the " +
         "rundown and record them again, then assemble.");
   }
-  plog("All " + S.segs.length + " takes read back in full.");
+  plog("All " + S.segs.length + " takes read back in full — loaded into the engine.");
 
-  const ff = await ffLoad();
   const ext = fileExt();
 
   /* Prepare each take now, in order, with the camera idle and nothing competing. */
