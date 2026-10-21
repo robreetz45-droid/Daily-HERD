@@ -244,6 +244,10 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
 .segcard.open{border-left-color:var(--shine)}
 .sc-stage{position:relative;width:100%;aspect-ratio:16/9;background:#06170F;overflow:hidden}
 .sc-stage video{position:absolute;object-fit:cover;background:#000;transform:scaleX(-1)}
+/* An inserted clip is footage, not a mirror. Flipping it here made its titles
+   read backwards and put the play on the wrong side of the pitch — in the card
+   only; the assembled show was always the right way round. */
+.sc-stage.clip video{transform:none;object-fit:contain}
 .sc-stage .sc-ov{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 .sc-stage .sc-play{position:absolute;left:0;right:0;bottom:0;height:34px;opacity:0;width:100%}
 .segcard video{display:block;background:#000}
@@ -254,6 +258,7 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
 .sc-org{grid-column:2/4;font-size:11px;color:var(--mist);letter-spacing:.05em;text-transform:uppercase;margin-top:-3px}
 .sc-bad{margin-left:8px;padding:2px 7px;border-radius:4px;background:#5A1111;color:#FFD9D9;font-family:var(--mono);font-size:9px;letter-spacing:.06em}
 .sc-clip{margin-left:8px;padding:2px 7px;border-radius:4px;background:#123A2A;color:#8FE0B0;font-family:var(--mono);font-size:9px;letter-spacing:.06em}
+.bringin{margin-top:12px;padding:12px 14px;border:1px solid var(--line2);border-radius:var(--r);background:rgba(255,255,255,.012)}
 .sc-slot{display:grid;grid-template-columns:44px 1fr;gap:6px;align-items:center;margin-bottom:7px;font-family:var(--mono);font-size:10px;color:var(--mist-dim)}
 .sc-slot select{width:100%;background:var(--panel2);color:var(--mist);border:1px solid var(--line2);border-radius:6px;padding:3px 6px;font-size:11px}
 .sc-b{padding:0 10px 10px}
@@ -676,7 +681,7 @@ function fileExt() {
   return f ? f[2] : "webm";
 }
 
-const BUILD = "2026-10-21a";   /* shown in the tally bar and printed at the top of
+const BUILD = "2026-10-21d";   /* shown in the tally bar and printed at the top of
    every assembly log, so which file the browser actually loaded is never a guess */
 const ovCache = new Map();      // rendered overlays, keyed by what they depend on
 const HAS_GAS = (typeof google !== "undefined" && google.script && google.script.run);
@@ -871,13 +876,37 @@ async function pullVideo(it) {
     return toast("That clip is " + kb(r.bytes) + " \u2014 too large to pull in directly. It is " +
       "downloading now; add it with \u201cInsert a video clip\u201d.", true);
   }
-  if (!r.dataUrl) return toast("That video came back empty.", true);
-
   let blob;
-  try {
-    const res = await fetch(r.dataUrl);
-    blob = await res.blob();
-  } catch (e) { return toast("Couldn't read that video.", true); }
+  if (r.chunked) {
+    /* Collected a piece at a time and joined here. Nothing on either side ever
+       holds the whole clip, which is what let a 46 MB video through at all. */
+    const parts = r.parts || [];
+    if (!parts.length) return toast("That video has no pieces stored.", true);
+    const buf = [];
+    for (let i = 0; i < parts.length; i++) {
+      toast("Fetching \u201c" + (it.videoName || it.slug) + "\u201d \u2014 piece " +
+        (i + 1) + " of " + parts.length + "\u2026");
+      let c;
+      try { c = await deskFetch({ action: "chunk", id: parts[i] }, 3); }
+      catch (e) { return toast("The video stopped arriving at piece " + (i + 1) + " of " +
+        parts.length + ": " + (e.message || e), true); }
+      if (!c.b64) return toast("Piece " + (i + 1) + " of that video came back empty.", true);
+      const bin = atob(c.b64);
+      const u8 = new Uint8Array(bin.length);
+      for (let j = 0; j < bin.length; j++) u8[j] = bin.charCodeAt(j);
+      buf.push(u8);
+    }
+    blob = new Blob(buf, { type: "video/mp4" });
+    if (r.bytes && blob.size !== r.bytes)
+      return toast("That video arrived incomplete \u2014 " + kb(blob.size) + " of " +
+        kb(r.bytes) + ". Try again.", true);
+  } else {
+    if (!r.dataUrl) return toast("That video came back empty.", true);
+    try {
+      const res = await fetch(r.dataUrl);
+      blob = await res.blob();
+    } catch (e) { return toast("Couldn't read that video.", true); }
+  }
 
   let dur = 0;
   try { dur = await blobDuration(blob); } catch (e) {}
@@ -888,7 +917,7 @@ async function pullVideo(it) {
     blob: blob, url: URL.createObjectURL(blob), dur: dur,
     direct: false, shownKey: null, look: S.look, bgKey: S.bgKey,
     cues: [], label: it.videoName ? it.videoName.replace(/\.[^.]+$/, "") : (it.slug + " \u2014 video"),
-    org: "Video"
+    org: ""
   });
   renderSegs(); renderRundown();
   toast("Added \u201c" + (it.videoName || it.slug) + "\u201d (" + kb(blob.size) +
@@ -2430,7 +2459,10 @@ function dressPreview(card, seg) {
     vid.style.left = "0"; vid.style.top = "0";
     vid.style.width = "100%"; vid.style.height = "100%";
     vid.style.borderRadius = "0";
-    if (look === "clip") vid.style.objectFit = "contain";
+    if (look === "clip") {
+      stage.classList.add("clip");
+      vid.style.transform = seg.flip ? "scaleX(-1)" : "none";
+    }
   }
   if (look === "clip") {
     /* a clip carries only the corner mark, so there is no story overlay to build */
@@ -2473,7 +2505,7 @@ async function importTakes(files, asClip) {
         id: "s" + Date.now() + "_" + added, key: "extra", kind: "video", imported: true,
         blob: f, url: URL.createObjectURL(f), dur: dur,
         direct: false, shownKey: null, look: S.look, bgKey: S.bgKey,
-        cues: [], label: name || "Video clip", org: "Video"
+        cues: [], label: name || "Video clip", org: ""
       });
       added++;
       continue;
@@ -2515,8 +2547,9 @@ function renderSegs() {
         '<img class="sc-ov" alt="">' +
       '</div>' +
       '<div class="sc-b">' +
-      '<div class="hint">Framed as it will appear. The graphics are added when you assemble. ' +
-      'To shorten a take, delete it and record again.</div>' +
+      (g.kind === "video" ? '' :
+       '<div class="hint">Framed as it will appear. The graphics are added when you assemble. ' +
+       'To shorten a take, delete it and record again.</div>') +
       (g.kind === "video"
         ? '<div class="hint">Plays full frame with its own sound. Move it with the arrows.</div>'
         : '<div class="sc-slot"><span>STORY</span><select data-slot="' + i + '">' +
@@ -2524,7 +2557,11 @@ function renderSegs() {
             (String(o.key) === String(g.shownKey != null ? g.shownKey : g.key) ? " selected" : "") +
             '>' + esc(o.label) + '</option>').join("") + '</select></div>') +
       '<div class="sc-a"><button data-a="up">↑</button><button data-a="dn">↓</button>' +
-      '<button data-a="re">Retake</button><button data-a="rn">Rename</button>' +
+      (g.kind === "video"
+        ? '<button data-a="flip"' + (g.flip ? ' style="border-color:var(--shine);color:var(--shine)"' : '') +
+          '>' + (g.flip ? '\u2713 Flipped' : 'Flip') + '</button>'
+        : '<button data-a="re">Retake</button>') +
+      '<button data-a="rn">Rename</button>' +
       '<button data-a="dl">Save</button><button class="del" data-a="rm">Delete</button></div></div>';
     const vid = d.querySelector("video");
     dressPreview(d, g);
@@ -2546,6 +2583,13 @@ function renderSegs() {
       if (a === "dn" && i < S.segs.length - 1) S.segs.splice(i + 1, 0, S.segs.splice(i, 1)[0]);
       if (a === "rm") { if (!confirm("Delete the segment \u201c" + g.label + "\u201d? It won't go to editing.")) return; S.segs.splice(i, 1); }
       if (a === "rn") { const n = prompt("Segment name:", g.label); if (n) g.label = n; }
+      if (a === "flip") {
+        g.flip = !g.flip;
+        g.normBlob = null; g.normKey = null;       // the clip has to be built again
+        renderSegs();
+        return toast(g.flip ? "Flipped. The card now shows how it will play."
+                            : "Back to the original way round.");
+      }
       if (a === "dl") download(g.blob, g.label.replace(/\W+/g, "-") + "." + fileExt());
       if (a === "re") {
         if (!confirm("Delete this segment and record it again?")) return;
@@ -2564,14 +2608,7 @@ function renderSegs() {
       '<button class="plusbtn" id="btnPlus" aria-label="Add a segment">+</button>' +
       '<div class="lbl">Add segment</div>' +
       '<div class="hint">' + (S.segs.length ? "Next up: " + esc(slotLabel(nextKey())) : "Start with the open, then work down the rundown.") + '</div>' +
-      '<div class="hint" style="margin-top:9px;border-top:1px solid var(--line2);padding-top:9px">' +
-      'Already have takes saved on this computer?<br>' +
-      '<button class="btn sm" id="btnImport" style="margin-top:6px">Add takes from files</button></div>' +
-      '<div class="hint" style="margin-top:9px;border-top:1px solid var(--line2);padding-top:9px">' +
-      'Play a video as part of the show \u2014 a student film, a highlight reel, a clip from a team.<br>' +
-      '<button class="btn sm" id="btnVideo" style="margin-top:6px">Insert a video clip</button></div>' +
-      '<input type="file" id="fileTakes" accept="video/*" multiple hidden>' +
-      '<input type="file" id="fileClip" accept="video/*" multiple hidden>';
+      '';
   } else {
     const opts = slotList().map(o =>
       '<option value="' + o.key + '"' + (String(o.key) === String(S.armed.key) ? " selected" : "") + '>' +
@@ -2586,6 +2623,19 @@ function renderSegs() {
       '<div class="hint" style="margin-top:7px">The prompter is parked at the top of this segment. Pause any time; the timing keeps up.</div>';
   }
   box.appendChild(add);
+
+  /* Bringing a file in has nothing to do with whether a slot is armed, so these sit
+     below the card in every state rather than only when nothing is queued up. */
+  const bring = el("div", "bringin");
+  bring.innerHTML =
+    '<div class="hint">Already have takes saved on this computer?<br>' +
+    '<button class="btn sm" id="btnImport" style="margin-top:6px">Add takes from files</button></div>' +
+    '<div class="hint" style="margin-top:10px;border-top:1px solid var(--line2);padding-top:10px">' +
+    'Play a video as part of the show \u2014 a student film, a highlight reel, a clip from a team.<br>' +
+    '<button class="btn sm" id="btnVideo" style="margin-top:6px">Insert a video clip</button></div>' +
+    '<input type="file" id="fileTakes" accept="video/*" multiple hidden>' +
+    '<input type="file" id="fileClip" accept="video/*" multiple hidden>';
+  box.appendChild(bring);
 
   if ($("btnPlus")) $("btnPlus").onclick = () => armSlot(null);
   if ($("btnImport")) $("btnImport").onclick = () => $("fileTakes").click();
@@ -3787,8 +3837,14 @@ async function prepareSegment(seg) {
     } catch (e) { hasAudio = false; }
     plog("   full-frame clip" + (hasAudio ? "" : " (no sound — silence added)"));
 
+    /* Phone and action cameras often store a flip or rotation as a flag on the
+       file rather than in the pixels. Players obey the flag; ffmpeg ignores it
+       while compositing, so a clip that looks right everywhere else can come out
+       reversed here. Rather than guess at the metadata, the card carries a Flip
+       button and this honours it. */
     let chain =
-      "[0:v]scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease," +
+      "[0:v]" + (seg.flip ? "hflip," : "") +
+      "scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease," +
       "pad=" + W + ":" + H + ":(ow-iw)/2:(oh-ih)/2:color=0x062A1A,setsar=1,fps=" + FPS + "[vid];" +
       "[vid][1:v]overlay=0:0:format=auto:shortest=1,format=yuv420p[vv]";
     let aChain = af;
@@ -3893,7 +3949,7 @@ function segKey(seg) {
   const it = (idx != null && S.items[idx]) ? S.items[idx] : null;
   const st = it ? strapFor(it) : { title: "", sub: "" };
   const a = adjOf(it);
-  return [normSpec(), seg.kind || "take", S.look, S.bgKey, seg.shownKey,
+  return [normSpec(), seg.kind || "take", seg.flip ? "flip" : "", S.look, S.bgKey, seg.shownKey,
           it && it.image ? it.image.length : -1,
           st.title, st.sub, a.fit, a.y, a.z,
           $("gImg").checked ? 1 : 0, $("gLower").checked ? 1 : 0,
