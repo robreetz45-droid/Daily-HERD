@@ -259,6 +259,18 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
 .sc-bad{margin-left:8px;padding:2px 7px;border-radius:4px;background:#5A1111;color:#FFD9D9;font-family:var(--mono);font-size:9px;letter-spacing:.06em}
 .sc-clip{margin-left:8px;padding:2px 7px;border-radius:4px;background:#123A2A;color:#8FE0B0;font-family:var(--mono);font-size:9px;letter-spacing:.06em}
 .bringin{margin-top:12px;padding:12px 14px;border:1px solid var(--line2);border-radius:var(--r);background:rgba(255,255,255,.012)}
+.slidecard{display:grid;grid-template-columns:26px 104px 1fr;gap:9px;align-items:center;padding:8px 10px;border:1px solid var(--line2);border-radius:var(--r);margin-bottom:7px;background:rgba(255,255,255,.012)}
+.slidecard.armed{border-color:var(--shine);background:rgba(125,224,160,.06)}
+.sl-n{font-family:var(--mono);font-size:11px;color:var(--mist-dim);text-align:right}
+.sl-thumb{width:104px;aspect-ratio:16/9;object-fit:contain;background:#07170F;border:1px solid var(--line2);border-radius:5px;display:block}
+.sl-b{min-width:0}
+.sl-state{font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;margin-bottom:5px}
+.sl-done{color:var(--shine)}
+.sl-todo{color:var(--mist-dim)}
+.sl-a{display:flex;gap:5px;align-items:center}
+.sl-a button{flex:0 0 auto;padding:3px 9px;border-radius:5px;border:1px solid var(--line2);background:var(--panel2);color:var(--mist);font-size:10.5px;cursor:pointer}
+.sl-a button:hover{border-color:var(--turf-lite);color:var(--shine)}
+.sl-a select{flex:1 1 auto;min-width:0;background:var(--panel2);color:var(--mist);border:1px solid var(--line2);border-radius:5px;padding:3px 5px;font-size:10px}
 .sc-slot{display:grid;grid-template-columns:44px 1fr;gap:6px;align-items:center;margin-bottom:7px;font-family:var(--mono);font-size:10px;color:var(--mist-dim)}
 .sc-slot select{width:100%;background:var(--panel2);color:var(--mist);border:1px solid var(--line2);border-radius:6px;padding:3px 6px;font-size:11px}
 .sc-b{padding:0 10px 10px}
@@ -325,6 +337,13 @@ kbd{font-family:var(--mono);font-size:11px;background:#071310;border:1px solid v
       <button class="btn sm" id="btnAddStory">Add story</button>
       <button class="btn sm" id="btnBuild">Build script</button>
     </div>
+    <div class="hd">Slides <span class="n" id="deckState"></span></div>
+    <div class="deck" style="border-bottom:0">
+      <button class="btn sm" id="btnDeck">Load a slide deck</button>
+      <button class="btn sm" id="deckClear" style="display:none">Clear</button>
+      <input type="file" id="fileDeck" accept="application/pdf,.pdf" hidden>
+    </div>
+    <div class="scroll" id="deckList" style="flex:0 1 auto;max-height:30vh"></div>
     <div class="hd">Segments <span class="n" id="segTot">0 recorded</span></div>
     <div class="scroll seglist" id="segList"></div>
   </section>
@@ -681,7 +700,7 @@ function fileExt() {
   return f ? f[2] : "webm";
 }
 
-const BUILD = "2026-10-21d";   /* shown in the tally bar and printed at the top of
+const BUILD = "2026-11-23b";   /* shown in the tally bar and printed at the top of
    every assembly log, so which file the browser actually loaded is never a guess */
 const ovCache = new Map();      // rendered overlays, keyed by what they depend on
 const HAS_GAS = (typeof google !== "undefined" && google.script && google.script.run);
@@ -1773,6 +1792,23 @@ function roundRect(x, a, b, w, h, rad) {
   x.arcTo(a, b + h, a, b, rad); x.arcTo(a, b, a + w, b, rad); x.closePath();
 }
 const HERO = { x: 58, y: 76, w: 560, h: 500 };     // picture, camera left
+
+/* Presenting from a deck: the slide owns the frame and the camera sits in one
+   corner of it, the way a recorded talk looks. 16:9 so the face is not squashed,
+   and far enough off the edge that a slide's own margin still breathes. */
+const SLIDECAM = { w: 352, h: 198, pad: 26 };
+function slideCamRect(corner) {
+  const c = corner || "br", m = SLIDECAM.pad;
+  const right = OUT_W - SLIDECAM.w - m, bottom = OUT_H - SLIDECAM.h - m;
+  const at = { br: [right, bottom], bl: [m, bottom], tr: [right, m], tl: [m, m] }[c] || [right, bottom];
+  return { x: at[0], y: at[1], w: SLIDECAM.w, h: SLIDECAM.h };
+}
+const CORNERS = [["br", "Bottom right"], ["bl", "Bottom left"],
+                 ["tr", "Top right"], ["tl", "Top left"], ["none", "No camera"]];
+function segLook(seg) {
+  if (seg && seg.kind === "slide") return "slide";
+  return S.look || "window";
+}
 function storyImg(item) {
   if (!item || !item.image) return null;
   primeImg(item);
@@ -1848,6 +1884,137 @@ function drawBug(x) {
   try { x.letterSpacing = "0px"; } catch (e) {}
 }
 
+/* ---------------------------------------------------------------
+   SLIDE DECKS
+   A deck is loaded once, as one file, and every page is turned into a picture
+   here. Exporting slides one at a time was the thing worth avoiding, so this
+   takes the PDF that Google Slides produces in a single download.
+--------------------------------------------------------------- */
+const slideImgs = [];                 // decoded, ready to draw
+function slideImg(i) { return (i == null) ? null : slideImgs[i] || null; }
+
+let pdfLib = null;
+async function pdfEngine() {
+  if (pdfLib) return pdfLib;
+  try {
+    pdfLib = await import("./pdf/pdf.min.js");
+  } catch (e) {
+    throw new Error("The slide reader is missing. Upload the pdf folder to the repo " +
+      "next to Studio.html, then reload. (" + (e.message || e) + ")");
+  }
+  pdfLib.GlobalWorkerOptions.workerSrc = "./pdf/pdf.worker.min.js";
+  return pdfLib;
+}
+
+async function loadDeck(file) {
+  if (!file) return;
+  const isPdf = /\.pdf$/i.test(file.name) || file.type === "application/pdf";
+  if (!isPdf)
+    return toast("That needs to be a PDF. In Google Slides: File \u2192 Download \u2192 " +
+      "PDF Document. One file, the whole deck.", true);
+
+  $("deckState").textContent = "Reading the deck\u2026";
+  let lib;
+  try { lib = await pdfEngine(); }
+  catch (e) { $("deckState").textContent = ""; return toast(e.message, true); }
+
+  try {
+    const data = new Uint8Array(await file.arrayBuffer());
+    const doc = await lib.getDocument({ data: data, useSystemFonts: true }).promise;
+    const made = [];
+    for (let n = 1; n <= doc.numPages; n++) {
+      $("deckState").textContent = "Rendering slide " + n + " of " + doc.numPages + "\u2026";
+      const page = await doc.getPage(n);
+      const base = page.getViewport({ scale: 1 });
+      /* rendered at the show's own width, so a slide is never upscaled later */
+      const vp = page.getViewport({ scale: canW() / base.width });
+      const c = document.createElement("canvas");
+      c.width = Math.round(vp.width); c.height = Math.round(vp.height);
+      await page.render({ canvasContext: c.getContext("2d"), viewport: vp }).promise;
+      const blob = await new Promise(r => c.toBlob(r, "image/png"));
+      made.push({ n: n, blob: blob, url: URL.createObjectURL(blob) });
+    }
+    S.deckName = file.name.replace(/\.pdf$/i, "");
+    S.slides = made;
+    slideImgs.length = 0;
+    made.forEach((sl, i) => {
+      const im = new Image();
+      im.src = sl.url;
+      slideImgs[i] = im;
+    });
+    await Promise.all(slideImgs.map(decoded));
+    $("deckState").textContent = "";
+    renderDeck();
+    toast(made.length + " slide" + (made.length === 1 ? "" : "s") + " loaded from \u201c" +
+      S.deckName + "\u201d. Record one at a time \u2014 press Record on a slide.");
+  } catch (e) {
+    $("deckState").textContent = "";
+    toast("That deck could not be read: " + (e.message || e), true);
+  }
+}
+
+function clearDeck() {
+  (S.slides || []).forEach(sl => { try { URL.revokeObjectURL(sl.url); } catch (e) {} });
+  S.slides = []; slideImgs.length = 0; S.deckName = "";
+  renderDeck(); renderSegs();
+}
+
+function slideTakeIdx(i) {
+  return S.segs.findIndex(g => g.kind === "slide" && g.slideIdx === i);
+}
+
+function renderDeck() {
+  const box = $("deckList"); if (!box) return;
+  const slides = S.slides || [];
+  $("deckClear").style.display = slides.length ? "" : "none";
+  if (!slides.length) {
+    box.innerHTML = '<div class="hint">No deck loaded. In Google Slides choose ' +
+      '<b>File \u2192 Download \u2192 PDF Document</b>, then load that one file here. ' +
+      'Every slide becomes its own take.</div>';
+    return;
+  }
+  box.innerHTML = "";
+  slides.forEach((sl, i) => {
+    const taken = slideTakeIdx(i);
+    const d = el("div", "slidecard" + (S.armed && S.armed.slide === i ? " armed" : ""));
+    d.innerHTML =
+      '<div class="sl-n">' + (i + 1) + '</div>' +
+      '<img class="sl-thumb" src="' + sl.url + '" alt="Slide ' + (i + 1) + '">' +
+      '<div class="sl-b">' +
+        '<div class="sl-state">' + (taken >= 0
+          ? '<span class="sl-done">\u2713 recorded \u00b7 ' + fmtDur(S.segs[taken].dur) + '</span>'
+          : '<span class="sl-todo">not recorded yet</span>') + '</div>' +
+        '<div class="sl-a">' +
+          '<button data-s="rec">' + (taken >= 0 ? "Record again" : "Record") + '</button>' +
+          '<select data-s="corner" title="Where the camera sits on this slide">' +
+            CORNERS.map(c => '<option value="' + c[0] + '"' +
+              (slideCorner(i) === c[0] ? " selected" : "") + '>' + c[1] + '</option>').join("") +
+          '</select>' +
+        '</div>' +
+      '</div>';
+    d.querySelector('[data-s="rec"]').onclick = () => armSlide(i);
+    d.querySelector('[data-s="corner"]').onchange = function () {
+      S.slideCorner[i] = this.value;
+      const t = slideTakeIdx(i);
+      if (t >= 0) {
+        S.segs[t].camCorner = this.value;
+        S.segs[t].normBlob = null; S.segs[t].normKey = null;   // rebuild it
+        renderSegs();
+      }
+    };
+    box.appendChild(d);
+  });
+}
+function slideCorner(i) { return (S.slideCorner && S.slideCorner[i]) || "br"; }
+
+function armSlide(i) {
+  S.armed = { key: "extra", slide: i };
+  S.shownKey = null;
+  S.rolling = false; $("btnRoll").textContent = "Roll";
+  renderDeck(); renderSegs(); setTransport("idle");
+  toast("Slide " + (i + 1) + " is up. Press Record when you are ready.");
+}
+
 function paintBackdrop(x, key) {
   x.fillStyle = "#062A1A";
   x.fillRect(0, 0, OUT_W, OUT_H);
@@ -1921,9 +2088,58 @@ function drawTitleCard(x, R) {
   try { x.letterSpacing = "0px"; } catch (e) {}
 }
 
+/* Which slide, if any, the monitor should be showing right now: the one armed for
+   recording, or the one belonging to the take being played back. */
+function liveSlideIdx() {
+  if (S.armed && S.armed.slide != null) return S.armed.slide;
+  return null;
+}
+
+function drawSlideFrame(x) {
+  const i = liveSlideIdx();
+  paintBackdrop(x, S.bgKey);
+  const sl = slideImg(i);
+  if (sl && sl.complete && sl.naturalWidth) {
+    const k = Math.min(OUT_W / sl.naturalWidth, OUT_H / sl.naturalHeight);
+    const w = sl.naturalWidth * k, h = sl.naturalHeight * k;
+    x.drawImage(sl, (OUT_W - w) / 2, (OUT_H - h) / 2, w, h);
+  }
+  const corner = slideCorner(i);
+  if (corner === "none") return;
+  const R = slideCamRect(corner);
+  x.save(); x.shadowColor = "rgba(0,0,0,.55)"; x.shadowBlur = 30; x.shadowOffsetY = 10;
+  roundRect(x, R.x, R.y, R.w, R.h, 14); x.fillStyle = "#0B1A13"; x.fill(); x.restore();
+  if (S.stream && video.videoWidth) {
+    x.save();
+    roundRect(x, R.x + 5, R.y + 5, R.w - 10, R.h - 10, 10); x.clip();
+    const cover = Math.max((R.w - 10) / video.videoWidth, (R.h - 10) / video.videoHeight);
+    const dw = video.videoWidth * cover, dh = video.videoHeight * cover;
+    const dx = R.x + 5 + ((R.w - 10) - dw) / 2, dy = R.y + 5 + ((R.h - 10) - dh) / 2;
+    if ($("mirror").checked) { x.translate(dx + dw, 0); x.scale(-1, 1); x.drawImage(video, 0, dy, dw, dh); }
+    else x.drawImage(video, dx, dy, dw, dh);
+    x.restore();
+  }
+  x.strokeStyle = SHINE; x.lineWidth = 3;
+  roundRect(x, R.x + 3, R.y + 3, R.w - 6, R.h - 6, 12); x.stroke();
+}
+
 function drawFrame(ts) {
   const x = pctx;
   sizeStage(); stage(x);
+  /* Presenting from a deck: the monitor shows the slide with the camera in its
+     corner, so what is on screen while recording is what the show will hold. */
+  if (liveSlideIdx() != null) {
+    drawSlideFrame(x);
+    if (S.recording && !S.paused) {
+      x.fillStyle = "rgba(255,59,48,.92)"; x.beginPath(); x.arc(OUT_W - 30, 30, 9, 0, 7); x.fill();
+    }
+    if (S.paused) {
+      x.fillStyle = "rgba(255,194,75,.95)";
+      x.fillRect(OUT_W - 38, 21, 6, 18); x.fillRect(OUT_W - 27, 21, 6, 18);
+    }
+    if (S.cd > 0) drawCountdown(x);
+    return;
+  }
   /* Always lay down the solid colour first, then the backdrop picture over it.
      A backdrop that is missing, still decoding, or transparent then costs us a
      photograph — not the whole frame. Painting it only as an "else" once left the
@@ -2355,7 +2571,28 @@ function onRecStop(rec, chunks) {
     return toast("That take recorded nothing at all \u2014 no video came back from the camera. " +
       "Nothing was added to the rundown. Check the camera preview is live, then roll again.", true);
   }
+  const onSlide = S.armed && S.armed.slide != null ? S.armed.slide : null;
   const key = S.armed ? S.armed.key : nextKey();
+  if (onSlide != null) {
+    /* One take per slide. Recording the same slide again replaces its take rather
+       than stacking a second one in the running order. */
+    const had = slideTakeIdx(onSlide);
+    const seg = {
+      id: "s" + Date.now(), key: "extra", kind: "slide", slideIdx: onSlide,
+      camCorner: slideCorner(onSlide),
+      blob: blob, url: URL.createObjectURL(blob), dur: dur,
+      direct: S.recDirect, shownKey: null, look: "slide", bgKey: S.bgKey,
+      cues: S.recCues.slice(),
+      label: (S.deckName ? S.deckName + " \u2014 " : "") + "Slide " + (onSlide + 1), org: ""
+    };
+    if (had >= 0) { try { URL.revokeObjectURL(S.segs[had].url); } catch (e) {} S.segs[had] = seg; }
+    else S.segs.push(seg);
+    S.armed = null;
+    setTransport("none");
+    renderDeck(); renderSegs(); renderRundown();
+    return toast("Slide " + (onSlide + 1) + " recorded \u2014 " + fmtDur(dur) +
+      ". Press Record on the next slide.");
+  }
   S.segs.push({
     id: "s" + Date.now(), key: key, blob, url: URL.createObjectURL(blob), dur,
     direct: S.recDirect, shownKey: S.shownKey, look: S.look, bgKey: S.bgKey,
@@ -2539,6 +2776,7 @@ function renderSegs() {
       '<div class="sc-h"><span class="sc-n">' + String(i + 1).padStart(2, "0") + '</span>' +
       '<b>' + esc(g.label) + '</b><span class="sc-d">' + fmtDur(g.dur) + '</span>' +
       (g.kind === "video" ? '<span class="sc-clip">VIDEO CLIP</span>' : '') +
+      (g.kind === "slide" ? '<span class="sc-clip">SLIDE ' + (g.slideIdx + 1) + '</span>' : '') +
       (g.blob && g.blob.size < 50000
         ? '<span class="sc-bad">DID NOT RECORD \u2014 DELETE AND RETAKE</span>' : '') +
       (g.org ? '<span class="sc-org">' + esc(g.org) + '</span>' : '') + '</div>' +
@@ -2550,14 +2788,18 @@ function renderSegs() {
       (g.kind === "video" ? '' :
        '<div class="hint">Framed as it will appear. The graphics are added when you assemble. ' +
        'To shorten a take, delete it and record again.</div>') +
-      (g.kind === "video"
+      (g.kind === "slide"
+        ? '<div class="hint">Slide ' + (g.slideIdx + 1) + ' of the deck. Change the camera corner ' +
+          'on the slide itself, up in Slides.</div>'
+        : g.kind === "video"
         ? '<div class="hint">Plays full frame with its own sound. Move it with the arrows.</div>'
         : '<div class="sc-slot"><span>STORY</span><select data-slot="' + i + '">' +
           slotList().map(o => '<option value="' + o.key + '"' +
             (String(o.key) === String(g.shownKey != null ? g.shownKey : g.key) ? " selected" : "") +
             '>' + esc(o.label) + '</option>').join("") + '</select></div>') +
       '<div class="sc-a"><button data-a="up">↑</button><button data-a="dn">↓</button>' +
-      (g.kind === "video"
+      (g.kind === "slide" ? '' :
+       g.kind === "video"
         ? '<button data-a="flip"' + (g.flip ? ' style="border-color:var(--shine);color:var(--shine)"' : '') +
           '>' + (g.flip ? '\u2713 Flipped' : 'Flip') + '</button>'
         : '<button data-a="re">Retake</button>') +
@@ -3206,6 +3448,14 @@ function musicMode() {
   const b = document.querySelector("#segMusic button[aria-pressed=true]");
   return b ? b.dataset.m : "rouser";
 }
+renderDeck();                      // so the panel explains itself before a deck is loaded
+$("btnDeck").onclick = () => $("fileDeck").click();
+$("fileDeck").onchange = function () { loadDeck(this.files[0]); this.value = ""; };
+$("deckClear").onclick = () => {
+  if (!confirm("Clear the deck? Takes already recorded stay in the rundown, but their " +
+               "slides will be gone, so they cannot be assembled.")) return;
+  clearDeck();
+};
 $("musicVol").oninput = paintMusicVol;
 $("musicVol").value = store.get("musicVol", 70);
 paintMusicVol();
@@ -3865,26 +4115,36 @@ async function prepareSegment(seg) {
   }
 
   async function composite(src) {
-    const look = S.look || "window";        // the control, not whatever was set when it recorded
+    /* A slide take carries its own look; everything else follows the Look control. */
+    const look = segLook(seg);
     /* Whole take, always. Per-segment trimming is gone: it added a second code path
        through compositing, and clips that took it came out with no graphics. */
     const useDur = realDur;
-    const R = camRect(look);
+    const R = camRect(look, seg);
     const png = "ov_" + seg.id + ".png";
     /* slot 0 is a real key, so test for absence rather than falsiness —
        `||` sent the first story of every show to the wrong item and lost its strap */
-    const shown = (seg.shownKey == null) ? S.shownKey : seg.shownKey;
-    await blobToFF(ff, png, await overlayPNG(shown, look, S.bgKey));
+    const shown = (look === "slide") ? null : ((seg.shownKey == null) ? S.shownKey : seg.shownKey);
+    await blobToFF(ff, png, await overlayPNG(shown, look, S.bgKey, seg));
     cleanup.push(png);
 
     let aChain = af;
-    let chain =
-      "[0:v]" + (S.mirror === false ? "" : "hflip,") +
-      "scale=" + R.w + ":" + R.h + ":force_original_aspect_ratio=increase," +
-      "crop=" + R.w + ":" + R.h + ",setsar=1,fps=" + FPS + "[cam];" +
-      "color=c=black:s=" + W + "x" + H + ":r=" + FPS + "[bgc];" +
-      "[bgc][cam]overlay=" + R.x + ":" + R.y + ":shortest=1[u];" +
-      "[u][1:v]overlay=0:0:format=auto:shortest=1,format=yuv420p[vv]";
+    const noCam = (look === "slide" && seg.camCorner === "none");
+    let chain;
+    if (noCam) {
+      /* Nothing of the camera is wanted here: the slide fills the frame and the
+         take supplies only the voice. The overlay already holds the slide. */
+      chain = "color=c=black:s=" + W + "x" + H + ":r=" + FPS + "[bgc];" +
+        "[bgc][1:v]overlay=0:0:format=auto:shortest=1,format=yuv420p[vv]";
+    } else {
+      chain =
+        "[0:v]" + (S.mirror === false ? "" : "hflip,") +
+        "scale=" + R.w + ":" + R.h + ":force_original_aspect_ratio=increase," +
+        "crop=" + R.w + ":" + R.h + ",setsar=1,fps=" + FPS + "[cam];" +
+        "color=c=black:s=" + W + "x" + H + ":r=" + FPS + "[bgc];" +
+        "[bgc][cam]overlay=" + R.x + ":" + R.y + ":shortest=1[u];" +
+        "[u][1:v]overlay=0:0:format=auto:shortest=1,format=yuv420p[vv]";
+    }
     if (fade > 0.01 && useDur > fade * 2.5) {
       const outAt = (useDur - fade).toFixed(3);
       chain += ";[vv]fade=t=in:st=0:d=" + fade + ",fade=t=out:st=" + outAt + ":d=" + fade + "[v]";
@@ -3896,7 +4156,8 @@ async function prepareSegment(seg) {
     a.push("-filter_complex", chain, "-map", "[v]", "-map", "0:a?", "-af", aChain,
       ...encFlags(), "-t", useDur.toFixed(3),
       "-avoid_negative_ts", "make_zero", "-y", outName);
-    await runStep(ff, a, "compositing “" + seg.label + "”", 12);
+    await runStep(ff, a, (look === "slide" ? "building slide " + (seg.slideIdx + 1) + " — “"
+      : "compositing “") + seg.label + "”", 12);
     return useDur;
   }
 
@@ -3949,7 +4210,9 @@ function segKey(seg) {
   const it = (idx != null && S.items[idx]) ? S.items[idx] : null;
   const st = it ? strapFor(it) : { title: "", sub: "" };
   const a = adjOf(it);
-  return [normSpec(), seg.kind || "take", seg.flip ? "flip" : "", S.look, S.bgKey, seg.shownKey,
+  return [normSpec(), seg.kind || "take", seg.flip ? "flip" : "",
+          seg.kind === "slide" ? "sl" + seg.slideIdx + (seg.camCorner || "br") : "",
+          S.look, S.bgKey, seg.shownKey,
           it && it.image ? it.image.length : -1,
           st.title, st.sub, a.fit, a.y, a.z,
           $("gImg").checked ? 1 : 0, $("gLower").checked ? 1 : 0,
@@ -3963,11 +4226,16 @@ function normProgress() {
 }
 
 /* the rectangle the camera occupies, in output pixels */
-function camRect(look) {
+function camRect(look, seg) {
   const r = resFactor();
-  const R = ((look || S.look) === "window") ? WIN : { x: 0, y: 0, w: OUT_W, h: OUT_H };
+  const L = look || S.look;
+  let R;
+  if (L === "slide") R = slideCamRect(seg && seg.camCorner);
+  else if (L === "window") R = WIN;
+  else R = { x: 0, y: 0, w: OUT_W, h: OUT_H };
   return { x: Math.round(R.x * r), y: Math.round(R.y * r),
-           w: Math.round(R.w * r), h: Math.round(R.h * r), rounded: (look || S.look) === "window" };
+           w: Math.round(R.w * r), h: Math.round(R.h * r),
+           rounded: L === "window" || L === "slide" };
 }
 
 /* One PNG holding the backdrop, the story picture, the banner and the bug,
@@ -3991,13 +4259,14 @@ function readyImg(item) {
   primeImg(item);
   return decoded(item._img);
 }
-async function overlayPNG(shownKey, look, bgKey) {
+async function overlayPNG(shownKey, look, bgKey, seg) {
   look = look || S.look || "window";
   {
     const i0 = itemIdxFor(shownKey);
     if (i0 != null && S.items[i0]) await readyImg(S.items[i0]);
     await decoded(bgImgs[bgKey || S.bgKey]);
     await decoded(bugImg); await decoded(openLogo);
+    if (look === "slide") await decoded(slideImg(seg && seg.slideIdx));
   }
   const c = document.createElement("canvas");
   c.width = canW(); c.height = canH();
@@ -4007,7 +4276,31 @@ async function overlayPNG(shownKey, look, bgKey) {
   const idx = itemIdxFor(shownKey);
   const item = (idx != null && S.items[idx]) ? S.items[idx] : null;
 
-  if (look === "window") {
+  if (look === "slide") {
+    /* The slide is the picture. It is drawn whole rather than cropped — a slide
+       with a figure near the edge must not lose it — and the camera is cut out of
+       one corner so the presenter shows through. */
+    paintBackdrop(x, bgKey || S.bgKey);
+    const sl = slideImg(seg && seg.slideIdx);
+    if (sl && sl.complete && sl.naturalWidth) {
+      const k = Math.min(OUT_W / sl.naturalWidth, OUT_H / sl.naturalHeight);
+      const w = sl.naturalWidth * k, h = sl.naturalHeight * k;
+      x.drawImage(sl, (OUT_W - w) / 2, (OUT_H - h) / 2, w, h);
+    }
+    const corner = (seg && seg.camCorner) || "br";
+    if (corner !== "none") {
+      const R = slideCamRect(corner);
+      x.save(); x.shadowColor = "rgba(0,0,0,.55)"; x.shadowBlur = 30; x.shadowOffsetY = 10;
+      roundRect(x, R.x, R.y, R.w, R.h, 14); x.fillStyle = "#0B1A13"; x.fill(); x.restore();
+      x.strokeStyle = SHINE; x.lineWidth = 3;
+      roundRect(x, R.x + 3, R.y + 3, R.w - 6, R.h - 6, 12); x.stroke();
+      x.save();
+      x.globalCompositeOperation = "destination-out";
+      roundRect(x, R.x + 5, R.y + 5, R.w - 10, R.h - 10, 10);
+      x.fillStyle = "#000"; x.fill();
+      x.restore();
+    }
+  } else if (look === "window") {
     paintBackdrop(x, bgKey || S.bgKey);
     drawHero(x, item);
 
@@ -4032,13 +4325,21 @@ async function overlayPNG(shownKey, look, bgKey) {
     drawLower(x, item);
   }
 
-  drawBug(x);                 // always last, so nothing can clip it
+  if (look !== "slide") drawBug(x);   // a slide carries its own titles; stay off it
 
   /* Prove the template actually painted before it is burned into the show.
      The Window look must have an opaque backdrop down the left edge, clear of
      the picture panel. If that strip is empty the overlay is blank, and a blank
      overlay is indistinguishable from no template at all — so stop here and say
      so, rather than shipping a bare talking head and finding out on YouTube. */
+  if (look === "slide") {
+    /* Same reasoning as the Window check below: an empty overlay here would mean
+       the slide never drew, and the show would be a camera on a blank screen. */
+    const mid = x.getImageData(Math.round(c.width * 0.5), Math.round(c.height * 0.12), 1, 1).data;
+    if (mid[3] < 250)
+      throw new Error("Slide " + (((seg && seg.slideIdx) || 0) + 1) + " did not render, so that " +
+        "segment would have come out blank. Nothing was assembled \u2014 load the deck again.");
+  }
   if (look === "window") {
     const sx = Math.round(20 / OUT_W * c.width);
     const px = x.getImageData(sx, Math.round(c.height * 0.25), 1, 1).data;
@@ -4481,6 +4782,8 @@ function pressSeg(group, value) {
 }
 function applyDefaults() {
   const bs = $("mBuild"); if (bs) bs.textContent = BUILD;
+  if (!S.slides) S.slides = [];
+  if (!S.slideCorner) S.slideCorner = {};
   S.look = "window";        // camera in its own frame, matching the picture
   S.mode = "off";           // no background removal
   S.bgKey = "green";        // studio green behind
