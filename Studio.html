@@ -700,7 +700,7 @@ function fileExt() {
   return f ? f[2] : "webm";
 }
 
-const BUILD = "2026-11-23d";   /* shown in the tally bar and printed at the top of
+const BUILD = "2026-11-23e";   /* shown in the tally bar and printed at the top of
    every assembly log, so which file the browser actually loaded is never a guess */
 const ovCache = new Map();      // rendered overlays, keyed by what they depend on
 const HAS_GAS = (typeof google !== "undefined" && google.script && google.script.run);
@@ -1906,9 +1906,15 @@ async function pdfEngine() {
     try {
       const probe = await fetch(url, { cache: "no-cache" });
       if (!probe.ok) { tried.push("pdf.min." + ext + " \u2014 not found (" + probe.status + ")"); continue; }
-      const type = probe.headers.get("content-type") || "";
-      if (/text\/html/i.test(type)) {
-        tried.push("pdf.min." + ext + " \u2014 the server sent a web page, not code");
+      /* Judge the file by what is inside it, not by its name. A static host hands
+         out a content type based on the extension alone, so a web page saved as
+         pdf.min.js is announced as JavaScript and only fails later, deep in the
+         parser, as "Unexpected token '<'". Read the first bytes instead. */
+      const head = (await probe.clone().text()).slice(0, 400);
+      if (/^\s*(<!doctype|<html|<\?xml|<)/i.test(head)) {
+        tried.push("pdf.min." + ext + " \u2014 that file holds a web page, not code. " +
+          "It is " + kb(+probe.headers.get("content-length") || head.length) +
+          "; the real one is about 329 KB. Download it again and re-upload it.");
         continue;
       }
       /* The probe above deliberately ignores the browser cache, but import() does
