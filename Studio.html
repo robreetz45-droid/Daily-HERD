@@ -700,7 +700,7 @@ function fileExt() {
   return f ? f[2] : "webm";
 }
 
-const BUILD = "2026-11-23b";   /* shown in the tally bar and printed at the top of
+const BUILD = "2026-11-23c";   /* shown in the tally bar and printed at the top of
    every assembly log, so which file the browser actually loaded is never a guess */
 const ovCache = new Map();      // rendered overlays, keyed by what they depend on
 const HAS_GAS = (typeof google !== "undefined" && google.script && google.script.run);
@@ -1894,16 +1894,34 @@ const slideImgs = [];                 // decoded, ready to draw
 function slideImg(i) { return (i == null) ? null : slideImgs[i] || null; }
 
 let pdfLib = null;
+/* Find the slide reader whatever it was named. A missing file comes back as the
+   host's own 404 page, and a web page parsed as code fails with "Unexpected token
+   '<'" — true but useless. So each candidate is fetched first and judged on its
+   status and content type, and what failed is reported by name. */
 async function pdfEngine() {
   if (pdfLib) return pdfLib;
-  try {
-    pdfLib = await import("./pdf/pdf.min.js");
-  } catch (e) {
-    throw new Error("The slide reader is missing. Upload the pdf folder to the repo " +
-      "next to Studio.html, then reload. (" + (e.message || e) + ")");
+  const tried = [];
+  for (const ext of ["js", "mjs"]) {
+    const url = "./pdf/pdf.min." + ext;
+    try {
+      const probe = await fetch(url, { cache: "no-cache" });
+      if (!probe.ok) { tried.push("pdf.min." + ext + " \u2014 not found (" + probe.status + ")"); continue; }
+      const type = probe.headers.get("content-type") || "";
+      if (/text\/html/i.test(type)) {
+        tried.push("pdf.min." + ext + " \u2014 the server sent a web page, not code");
+        continue;
+      }
+      pdfLib = await import(url);
+      pdfLib.GlobalWorkerOptions.workerSrc = "./pdf/pdf.worker.min." + ext;
+      plog && plog("Slide reader loaded from pdf/pdf.min." + ext + ".");
+      return pdfLib;
+    } catch (e) {
+      tried.push("pdf.min." + ext + " \u2014 " + (e.message || e));
+    }
   }
-  pdfLib.GlobalWorkerOptions.workerSrc = "./pdf/pdf.worker.min.js";
-  return pdfLib;
+  throw new Error("Could not load the slide reader from the pdf folder. " + tried.join("; ") +
+    ". The folder must sit beside Studio.html and hold pdf.min.js and pdf.worker.min.js, " +
+    "spelled in lower case.");
 }
 
 async function loadDeck(file) {
