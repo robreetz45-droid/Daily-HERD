@@ -700,7 +700,7 @@ function fileExt() {
   return f ? f[2] : "webm";
 }
 
-const BUILD = "2026-11-23c";   /* shown in the tally bar and printed at the top of
+const BUILD = "2026-11-23d";   /* shown in the tally bar and printed at the top of
    every assembly log, so which file the browser actually loaded is never a guess */
 const ovCache = new Map();      // rendered overlays, keyed by what they depend on
 const HAS_GAS = (typeof google !== "undefined" && google.script && google.script.run);
@@ -1911,8 +1911,14 @@ async function pdfEngine() {
         tried.push("pdf.min." + ext + " \u2014 the server sent a web page, not code");
         continue;
       }
-      pdfLib = await import(url);
-      pdfLib.GlobalWorkerOptions.workerSrc = "./pdf/pdf.worker.min." + ext;
+      /* The probe above deliberately ignores the browser cache, but import() does
+         not — so a 404 page stored before the file was uploaded keeps being served
+         to the importer while the probe sees the real thing. Tagging the URL with
+         the build makes it a new address, which sidesteps the stale entry without
+         disabling caching for everyone else. */
+      const bust = "?b=" + encodeURIComponent(BUILD);
+      pdfLib = await import(url + bust);
+      pdfLib.GlobalWorkerOptions.workerSrc = "./pdf/pdf.worker.min." + ext + bust;
       plog && plog("Slide reader loaded from pdf/pdf.min." + ext + ".");
       return pdfLib;
     } catch (e) {
